@@ -177,22 +177,29 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 				if len(short) > 12 {
 					short = short[:12]
 				}
-				bars[key] = prog.AddBar(total,
+				bar := prog.AddBar(total,
+					mpb.BarFillerClearOnComplete(),
 					mpb.PrependDecorators(
-						decor.Name("Pulling "+short),
+						decor.OnComplete(decor.Name("Pulling  "+short), "Pulled   "+short),
 					),
 					mpb.AppendDecorators(
-						decor.CountersKibiByte("% .2f / % .2f"),
-						decor.Name(" "),
-						decor.AverageSpeed(decor.SizeB1024(0), "% .2f"),
+						decor.OnComplete(decor.CountersKibiByte("% .1f / % .1f"), ""),
+						decor.OnComplete(decor.Name("  "), ""),
+						decor.OnComplete(decor.AverageSpeed(decor.SizeB1024(0), "% .1f"), ""),
 					),
 				)
+				if total == 0 {
+					bar.SetTotal(0, true)
+				}
+				bars[key] = bar
 			case types.ProgressEventRead:
 				if bar, ok := bars[key]; ok {
 					bar.IncrInt64(int64(p.OffsetUpdate))
 				}
 			case types.ProgressEventDone:
 				if bar, ok := bars[key]; ok {
+					// SetTotal with triggerComplete forces current=total regardless of
+					// timing, then fires done() — the OnComplete decorators take over.
 					bar.SetTotal(int64(p.Offset), true)
 					delete(bars, key)
 				}
@@ -200,6 +207,7 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 				if bar, ok := bars[key]; ok {
 					bar.Abort(true)
 					delete(bars, key)
+					fmt.Fprintf(prog, "Cached   %s\n", p.Artifact.Digest.Hex()[:12])
 				}
 			}
 		}

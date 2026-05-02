@@ -263,6 +263,33 @@ func tagFromRef(ref string) string {
 	return "latest"
 }
 
+// newLayerBar creates a single-bar mpb.Progress following podman's ProgressBar
+// pattern (utils/utils.go).  A separate Progress per layer lets p.Wait() block
+// until the bar goroutine exits, so the final state is always committed before
+// the next layer starts — preventing stale byte-count renders.
+func newLayerBar(prefix, onComplete string, size int64) (*mpb.Progress, *mpb.Bar) {
+	p := mpb.New(
+		mpb.WithWidth(80),
+		mpb.WithOutput(os.Stderr),
+		mpb.WithRefreshRate(180*time.Millisecond),
+	)
+	bar := p.AddBar(size,
+		mpb.BarFillerClearOnComplete(),
+		mpb.PrependDecorators(
+			decor.OnComplete(decor.Name(prefix), onComplete),
+		),
+		mpb.AppendDecorators(
+			decor.OnComplete(decor.CountersKibiByte("% .1f / % .1f"), ""),
+			decor.OnComplete(decor.Name("  "), ""),
+			decor.OnComplete(decor.AverageSpeed(decor.SizeB1024(0), "% .1f"), ""),
+		),
+	)
+	if size <= 0 {
+		bar.SetTotal(0, true)
+	}
+	return p, bar
+}
+
 // ---------------------------------------------------------------------------
 // Exported CGO functions
 // ---------------------------------------------------------------------------
@@ -427,8 +454,9 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		return errResp(fmt.Errorf("write config blob: %w", err))
 	}
 
-	// Fetch layers with progress bars
-	prog := mpb.New(mpb.WithOutput(os.Stderr))
+	// Fetch layers — one mpb.Progress per layer, matching podman's ProgressBar pattern:
+	// a fresh Progress + p.Wait() per layer guarantees the bar goroutine exits and the
+	// final state is committed before we move on, avoiding stale byte-count displays.
 	for _, layer := range manifest.Layers {
 		shortDigest := layer.Digest.Hex()
 		if len(shortDigest) > 12 {
@@ -436,37 +464,25 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		}
 		// Skip the HTTP connection entirely if the blob is already complete
 		if blobExists(layoutDir, layer) {
-			fmt.Fprintf(prog, "Cached   %s\n", shortDigest)
+			fmt.Fprintf(os.Stderr, "Cached   %s\n", shortDigest)
 			continue
 		}
 		layerRC, err := fetcher.Fetch(ctx, layer)
 		if err != nil {
-			prog.Wait()
 			return errResp(fmt.Errorf("fetch layer %s: %w", layer.Digest, err))
 		}
-		bar := prog.AddBar(layer.Size,
-			mpb.PrependDecorators(
-				decor.Name("Pulling  "+shortDigest),
-			),
-			mpb.AppendDecorators(
-				decor.CountersKibiByte("% .2f / % .2f"),
-				decor.Name(" "),
-				decor.AverageSpeed(decor.SizeB1024(0), "% .2f"),
-			),
-		)
+		p, bar := newLayerBar("Pulling  "+shortDigest, "Pulled   "+shortDigest, layer.Size)
 		proxyRC := bar.ProxyReader(layerRC)
-		desc, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
+		_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
 		proxyRC.Close()
 		if writeErr != nil {
 			bar.Abort(false)
-			prog.Wait()
+		}
+		p.Wait()
+		if writeErr != nil {
 			return errResp(fmt.Errorf("write layer %s: %w", layer.Digest, writeErr))
 		}
-		// Defensive: ensure the bar reflects the actual byte count even when
-		// the download completes faster than mpb's 150ms render tick.
-		bar.SetCurrent(desc.Size)
 	}
-	prog.Wait()
 
 	if err := updateIndex(layoutDir, ref, manifestDesc); err != nil {
 		return errResp(err)
