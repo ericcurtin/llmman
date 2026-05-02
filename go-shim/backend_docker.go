@@ -102,8 +102,14 @@ func writeBlob(layoutDir string, mediaType string, data []byte) (ocispec.Descrip
 // dgst is the expected digest; the blob is skipped if already complete, and
 // the computed digest is verified against dgst before the file is committed.
 // A deterministic <dest>.part file is used so interrupted downloads are
-// identifiable and do not leave random orphan files.
-func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst digest.Digest) (ocispec.Descriptor, error) {
+// identifiable.
+//
+// partOffset is the number of bytes already present in the .part file from a
+// previous interrupted download (the caller must have already seeked r to that
+// offset).  When > 0, the function opens the .part file in append mode and
+// seeds the digest hasher by streaming the existing bytes so the final digest
+// can still be verified end-to-end.
+func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst digest.Digest, partOffset int64) (ocispec.Descriptor, error) {
 	dir := filepath.Join(layoutDir, "blobs", dgst.Algorithm().String())
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return ocispec.Descriptor{}, err
@@ -114,20 +120,45 @@ func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst 
 		return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: fi.Size()}, nil
 	}
 	tmp := dest + ".part"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return ocispec.Descriptor{}, err
-	}
 	digester := digest.Canonical.Digester()
+	var f *os.File
+	startOffset := int64(0)
+
+	if partOffset > 0 {
+		// Seed the hasher with the already-downloaded bytes so we can verify the
+		// full digest at the end, then open the file for appending.
+		if pf, err := os.Open(tmp); err == nil {
+			_, hashErr := io.Copy(digester.Hash(), pf)
+			pf.Close()
+			if hashErr == nil {
+				f, err = os.OpenFile(tmp, os.O_APPEND|os.O_WRONLY, 0o644)
+				if err == nil {
+					startOffset = partOffset
+				}
+			}
+		}
+		if f == nil {
+			digester = digest.Canonical.Digester() // reset on any failure
+		}
+	}
+
+	if f == nil {
+		var err error
+		if f, err = os.Create(tmp); err != nil {
+			return ocispec.Descriptor{}, err
+		}
+	}
+
 	written, err := io.Copy(io.MultiWriter(f, digester.Hash()), r)
 	f.Close()
 	if err != nil {
 		os.Remove(tmp)
 		return ocispec.Descriptor{}, err
 	}
-	if size > 0 && written != size {
+	total := startOffset + written
+	if size > 0 && total != size {
 		os.Remove(tmp)
-		return ocispec.Descriptor{}, fmt.Errorf("size mismatch: expected %d got %d", size, written)
+		return ocispec.Descriptor{}, fmt.Errorf("size mismatch: expected %d got %d", size, total)
 	}
 	if got := digester.Digest(); got != dgst {
 		os.Remove(tmp)
@@ -137,7 +168,7 @@ func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst 
 		os.Remove(tmp)
 		return ocispec.Descriptor{}, err
 	}
-	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: written}, nil
+	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: total}, nil
 }
 
 // blobExists reports whether a blob is already fully stored in the layout.
@@ -487,8 +518,25 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 				bar.Abort(false)
 				return fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
 			}
+			// Resume from an existing partial download: seek the HTTP reader to
+			// the already-downloaded offset (containerd's httpReadSeeker issues a
+			// Range: bytes=N- request, or discards N bytes if the server doesn't
+			// support range requests) and pre-fill the progress bar.
+			partOffset := int64(0)
+			partPath := blobPath(layoutDir, layer.Digest) + ".part"
+			if fi, statErr := os.Stat(partPath); statErr == nil && fi.Size() > 0 {
+				if seeker, ok := layerRC.(io.ReadSeeker); ok {
+					if _, seekErr := seeker.Seek(fi.Size(), io.SeekStart); seekErr == nil {
+						partOffset = fi.Size()
+						bar.IncrInt64(partOffset)
+					}
+				}
+			}
 			proxyRC := bar.ProxyReader(layerRC)
-			_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
+			if proxyRC == nil { // bar already done (zero-size layer)
+				proxyRC = io.NopCloser(layerRC)
+			}
+			_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest, partOffset)
 			proxyRC.Close()
 			if writeErr != nil {
 				bar.Abort(false)
