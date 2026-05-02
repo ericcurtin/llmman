@@ -1,0 +1,36 @@
+use std::path::PathBuf;
+
+use clap::Args;
+
+use crate::storage::OciStore;
+
+#[derive(Args, Debug)]
+pub struct RmArgs {
+    /// Reference(s) to remove (e.g. registry.example.com/mymodel:latest)
+    #[arg(value_name = "REFERENCE", required = true, num_args = 1..)]
+    pub references: Vec<String>,
+
+    /// Local store directory (overrides default)
+    #[arg(long, value_name = "DIR")]
+    pub store: Option<PathBuf>,
+}
+
+pub fn run(args: &RmArgs) -> anyhow::Result<()> {
+    let store_root = crate::default_store(args.store.as_deref())?;
+    let store = OciStore::open(&store_root)?;
+
+    let mut any_err = false;
+    for reference in &args.references {
+        match store.remove(reference) {
+            Ok(()) => println!("Removed {}", reference),
+            Err(e) => {
+                eprintln!("Error removing {}: {}", reference, e);
+                any_err = true;
+            }
+        }
+    }
+    if any_err {
+        anyhow::bail!("one or more removals failed");
+    }
+    Ok(())
+}

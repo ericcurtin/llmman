@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux x86_64 ──────────────────────────────────────────────────
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            go-os: linux
+            binary: llmman
+
+          # ── Linux aarch64 ─────────────────────────────────────────────────
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            go-os: linux
+            binary: llmman
+
+          # ── macOS aarch64 (Apple Silicon) ─────────────────────────────────
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            go-os: darwin
+            binary: llmman
+
+          # ── Windows x86_64 ────────────────────────────────────────────────
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            go-os: windows
+            binary: llmman.exe
+
+          # ── Windows aarch64 ───────────────────────────────────────────────
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            go-os: windows
+            binary: llmman.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Go toolchain ──────────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go-shim/go.sum
+
+      # ── Rust toolchain ────────────────────────────────────────────────────
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # ── Go module cache ───────────────────────────────────────────────────
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ matrix.go-os }}-${{ hashFiles('go-shim/go.sum') }}
+          restore-keys: go-${{ matrix.go-os }}-
+
+      # ── Windows: ensure MSVC C compiler is on PATH ────────────────────────
+      # CGO on Windows requires a C compiler; Visual Studio ships cl.exe.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ── Linux: install C toolchain if needed ──────────────────────────────
+      - name: Install C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y gcc
+
+      # ── Build (Docker backend, default) ───────────────────────────────────
+      - name: Build (docker backend)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ── Build (Podman backend) ────────────────────────────────────────────
+      # Skip on Windows: podman's containers/image has limited Windows support.
+      - name: Build (podman backend)
+        if: runner.os != 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
+
+      # ── Upload artefacts ──────────────────────────────────────────────────
+      - name: Upload binary (docker)
+        uses: actions/upload-artifact@v4
+        with:
+          name: llmman-docker-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Release: attach binaries to GitHub Releases on tag push
+  # --------------------------------------------------------------------------
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: llmman-docker-*
+          merge-multiple: false
+
+      - name: Rename binaries for release
+        shell: bash
+        run: |
+          cd dist
+          for dir in */; do
+            target="${dir%/}"          # e.g. llmman-docker-x86_64-unknown-linux-gnu
+            triple="${target#llmman-docker-}"
+            src="$dir/llmman"
+            [ -f "$dir/llmman.exe" ] && src="$dir/llmman.exe"
+            ext="${src##*.}"
+            [ "$ext" = "llmman" ] && ext=""  # no extension
+            [ "$ext" != "" ] && ext=".$ext"
+            cp "$src" "llmman-${triple}${ext}"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/llmman-*

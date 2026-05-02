@@ -1,0 +1,30 @@
+[package]
+name = "llmman"
+version = "0.1.0"
+edition = "2021"
+description = "LLM model management tool using Docker or Podman transport libraries"
+license = "Apache-2.0"
+
+[[bin]]
+name = "llmman"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "wrap_help"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+anyhow = "1"
+walkdir = "2"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+tar = "0.4"
+
+[features]
+default = ["docker"]
+docker = []
+podman = []
+
+[build-dependencies]
+# build.rs uses only std

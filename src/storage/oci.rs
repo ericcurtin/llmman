@@ -1,0 +1,424 @@
+//! Local OCI Image Layout store.
+//!
+//! Implements a subset of the OCI Image Layout spec
+//! (<https://github.com/opencontainers/image-spec/blob/main/image-layout.md>)
+//! sufficient for llmman's local operations: build, list, rm, tag, inspect-local.
+//!
+//! Layout on disk:
+//! ```text
+//! <store-root>/
+//!   oci-layout             {"imageLayoutVersion":"1.0.0"}
+//!   index.json             OCI image index
+//!   blobs/
+//!     sha256/
+//!       <hex>              one file per blob
+//! ```
+
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as Sha2Digest, Sha256};
+
+// ---------------------------------------------------------------------------
+// Minimal OCI spec types (no external crate needed)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Descriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Index {
+    pub schema_version: u32,
+    pub media_type: String,
+    pub manifests: Vec<Descriptor>,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Self {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.index.v1+json".into(),
+            manifests: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Manifest {
+    pub schema_version: u32,
+    pub media_type: String,
+    pub config: Descriptor,
+    pub layers: Vec<Descriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageConfig {
+    pub created: String,
+    pub architecture: String,
+    pub os: String,
+    pub labels: std::collections::HashMap<String, String>,
+}
+
+/// Summary of a locally stored image shown by `list`.
+#[derive(Debug)]
+pub struct ImageSummary {
+    pub reference: String,
+    pub digest: String,
+    #[allow(dead_code)]
+    pub media_type: String,
+    pub size: u64,
+}
+
+// ---------------------------------------------------------------------------
+// OciStore
+// ---------------------------------------------------------------------------
+
+pub struct OciStore {
+    root: PathBuf,
+}
+
+impl OciStore {
+    /// Open (or create) an OCI layout store at `root`.
+    pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(root.join("blobs").join("sha256"))?;
+
+        // Write oci-layout marker if absent
+        let marker = root.join("oci-layout");
+        if !marker.exists() {
+            fs::write(&marker, r#"{"imageLayoutVersion":"1.0.0"}"#)?;
+        }
+        // Create empty index if absent
+        let index_path = root.join("index.json");
+        if !index_path.exists() {
+            let idx = Index::default();
+            fs::write(&index_path, serde_json::to_string_pretty(&idx)?)?;
+        }
+        Ok(Self { root })
+    }
+
+    #[allow(dead_code)]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // ------------------------------------------------------------------
+    // Index
+    // ------------------------------------------------------------------
+
+    pub fn read_index(&self) -> anyhow::Result<Index> {
+        let data = fs::read(self.root.join("index.json"))
+            .context("read index.json")?;
+        serde_json::from_slice(&data).context("parse index.json")
+    }
+
+    fn write_index(&self, idx: &Index) -> anyhow::Result<()> {
+        let tmp = self.root.join("index.json.tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(idx)?)?;
+        fs::rename(tmp, self.root.join("index.json"))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Blobs
+    // ------------------------------------------------------------------
+
+    fn blob_path(&self, digest: &str) -> anyhow::Result<PathBuf> {
+        let (algo, hex) = split_digest(digest)?;
+        Ok(self.root.join("blobs").join(algo).join(hex))
+    }
+
+    /// Write `data` as a blob.  Returns its `Descriptor`.
+    pub fn write_blob(&self, media_type: &str, data: &[u8]) -> anyhow::Result<Descriptor> {
+        let hex = hex::encode(Sha256::digest(data));
+        let digest = format!("sha256:{}", hex);
+        let path = self.root.join("blobs").join("sha256").join(&hex);
+        if !path.exists() {
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, data)?;
+            fs::rename(tmp, &path)?;
+        }
+        Ok(Descriptor {
+            media_type: media_type.into(),
+            digest,
+            size: data.len() as u64,
+            annotations: None,
+        })
+    }
+
+    /// Write a large file as a blob, streaming to avoid buffering the whole file.
+    #[allow(dead_code)]
+    pub fn write_blob_file(
+        &self,
+        media_type: &str,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<Descriptor> {
+        let path = path.as_ref();
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let tmp = self
+            .root
+            .join("blobs")
+            .join("sha256")
+            .join(format!("tmp-{}", std::process::id()));
+        {
+            let mut src = fs::File::open(path)
+                .with_context(|| format!("open {}", path.display()))?;
+            let mut dst = fs::File::create(&tmp)?;
+            let mut buf = vec![0u8; 1 << 20]; // 1 MiB chunks
+            loop {
+                let n = src.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                dst.write_all(&buf[..n])?;
+                size += n as u64;
+            }
+        }
+        let hex = hex::encode(hasher.finalize());
+        let digest = format!("sha256:{}", hex);
+        let dest = self.root.join("blobs").join("sha256").join(&hex);
+        if dest.exists() {
+            fs::remove_file(&tmp)?;
+        } else {
+            fs::rename(tmp, &dest)?;
+        }
+        Ok(Descriptor {
+            media_type: media_type.into(),
+            digest,
+            size,
+            annotations: None,
+        })
+    }
+
+    /// Read a blob's raw bytes.
+    pub fn read_blob(&self, digest: &str) -> anyhow::Result<Vec<u8>> {
+        fs::read(self.blob_path(digest)?).with_context(|| format!("read blob {}", digest))
+    }
+
+    // ------------------------------------------------------------------
+    // Manifest helpers
+    // ------------------------------------------------------------------
+
+    pub fn write_manifest(&self, manifest: &Manifest) -> anyhow::Result<Descriptor> {
+        let data = serde_json::to_vec(manifest)?;
+        self.write_blob("application/vnd.oci.image.manifest.v1+json", &data)
+    }
+
+    pub fn read_manifest(&self, digest: &str) -> anyhow::Result<Manifest> {
+        let data = self.read_blob(digest)?;
+        serde_json::from_slice(&data).context("parse manifest")
+    }
+
+    // ------------------------------------------------------------------
+    // Tag operations
+    // ------------------------------------------------------------------
+
+    /// Add a reference to `index.json`, replacing any prior entry with the same ref name.
+    /// The full `reference` string is stored in the annotation so `list` shows it verbatim.
+    pub fn tag(&self, mut desc: Descriptor, reference: &str) -> anyhow::Result<()> {
+        let mut ann = desc.annotations.take().unwrap_or_default();
+        ann.insert(
+            "org.opencontainers.image.ref.name".into(),
+            reference.to_string(),
+        );
+        desc.annotations = Some(ann);
+
+        let mut idx = self.read_index()?;
+        let mut replaced = false;
+        for entry in &mut idx.manifests {
+            if ref_matches(entry, reference) {
+                *entry = desc.clone();
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            idx.manifests.push(desc);
+        }
+        self.write_index(&idx)
+    }
+
+    /// Find the descriptor for `reference` in the index.
+    /// Matches either the full stored reference or (as fallback) just its tag component.
+    pub fn find(&self, reference: &str) -> anyhow::Result<Descriptor> {
+        let idx = self.read_index()?;
+        idx.manifests
+            .into_iter()
+            .find(|m| ref_matches(m, reference))
+            .ok_or_else(|| anyhow!("image not found: {}", reference))
+    }
+
+    // ------------------------------------------------------------------
+    // List / Remove
+    // ------------------------------------------------------------------
+
+    pub fn list(&self) -> anyhow::Result<Vec<ImageSummary>> {
+        let idx = self.read_index()?;
+        Ok(idx
+            .manifests
+            .into_iter()
+            .map(|m| {
+                let reference = m
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+                    .cloned()
+                    .unwrap_or_else(|| m.digest.clone());
+                ImageSummary {
+                    reference,
+                    digest: m.digest,
+                    media_type: m.media_type,
+                    size: m.size,
+                }
+            })
+            .collect())
+    }
+
+    /// Remove a manifest from the index by reference.  Does not GC blobs.
+    pub fn remove(&self, reference: &str) -> anyhow::Result<()> {
+        let mut idx = self.read_index()?;
+        let before = idx.manifests.len();
+        idx.manifests.retain(|m| !ref_matches(m, reference));
+        if idx.manifests.len() == before {
+            return Err(anyhow!("image not found: {}", reference));
+        }
+        self.write_index(&idx)
+    }
+
+    // ------------------------------------------------------------------
+    // Build helpers
+    // ------------------------------------------------------------------
+
+    /// Package all files in `src_dir` as an OCI image stored in this layout.
+    /// Each file becomes one uncompressed tar layer.
+    /// Returns the manifest descriptor.
+    pub fn build(
+        &self,
+        src_dir: impl AsRef<Path>,
+        reference: &str,
+        labels: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<Descriptor> {
+        use walkdir::WalkDir;
+
+        let src_dir = src_dir.as_ref();
+        let mut layers: Vec<Descriptor> = Vec::new();
+
+        // One layer per file (uncompressed tar, filename preserved via annotation)
+        for entry in WalkDir::new(src_dir).follow_links(true) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(src_dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+
+            // Build a minimal tar with a single entry
+            let tar_data = make_single_file_tar(entry.path(), &rel)?;
+            let mut desc = self.write_blob(
+                "application/vnd.oci.image.layer.v1.tar",
+                &tar_data,
+            )?;
+            desc.annotations = Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("org.opencontainers.image.title".into(), rel);
+                m
+            });
+            layers.push(desc);
+        }
+
+        if layers.is_empty() {
+            return Err(anyhow!("no files found in {}", src_dir.display()));
+        }
+
+        // Config
+        let config = ImageConfig {
+            created: chrono::Utc::now().to_rfc3339(),
+            architecture: std::env::consts::ARCH.to_string(),
+            os: std::env::consts::OS.to_string(),
+            labels: labels.clone(),
+        };
+        let config_data = serde_json::to_vec(&config)?;
+        let config_desc =
+            self.write_blob("application/vnd.oci.image.config.v1+json", &config_data)?;
+
+        // Manifest
+        let manifest = Manifest {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            config: config_desc,
+            layers,
+            annotations: None,
+        };
+        let manifest_desc = self.write_manifest(&manifest)?;
+        self.tag(manifest_desc.clone(), reference)?;
+        Ok(manifest_desc)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true if the descriptor's ref annotation matches `reference`.
+/// Supports exact match (full ref) or tag-only match for convenience.
+fn ref_matches(desc: &Descriptor, reference: &str) -> bool {
+    desc.annotations
+        .as_ref()
+        .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+        .map(|stored| stored == reference || tag_from_ref(stored) == reference)
+        .unwrap_or(false)
+}
+
+fn split_digest(digest: &str) -> anyhow::Result<(&str, &str)> {
+    let mut parts = digest.splitn(2, ':');
+    let algo = parts.next().ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
+    let hex = parts.next().ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
+    Ok((algo, hex))
+}
+
+pub fn tag_from_ref(reference: &str) -> &str {
+    if let Some(pos) = reference.rfind(':') {
+        if pos > reference.rfind('/').unwrap_or(0) {
+            return &reference[pos + 1..];
+        }
+    }
+    "latest"
+}
+
+/// Build an in-memory uncompressed tar archive containing a single file.
+fn make_single_file_tar(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
+    let file_data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut buf = Vec::new();
+    {
+        let mut archive = tar::Builder::new(&mut buf);
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name)?;
+        header.set_size(file_data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, file_data.as_slice())?;
+        archive.finish()?;
+    }
+    Ok(buf)
+}
