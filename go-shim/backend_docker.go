@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -31,6 +32,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
+	"golang.org/x/sync/errgroup"
 )
 
 // ---------------------------------------------------------------------------
@@ -263,16 +265,11 @@ func tagFromRef(ref string) string {
 	return "latest"
 }
 
-// newLayerBar creates a single-bar mpb.Progress following podman's ProgressBar
-// pattern (utils/utils.go).  A separate Progress per layer lets p.Wait() block
-// until the bar goroutine exits, so the final state is always committed before
-// the next layer starts — preventing stale byte-count renders.
-func newLayerBar(prefix, onComplete string, size int64) (*mpb.Progress, *mpb.Bar) {
-	p := mpb.New(
-		mpb.WithWidth(80),
-		mpb.WithOutput(os.Stderr),
-		mpb.WithRefreshRate(180*time.Millisecond),
-	)
+// addLayerBar adds a progress bar into an existing mpb.Progress, using the same
+// decorator choices as podman's utils.ProgressBar: OnComplete swaps the label to
+// the completion string and clears the byte/speed counters so the final static
+// line is always correct regardless of render-tick timing.
+func addLayerBar(p *mpb.Progress, prefix, onComplete string, size int64) *mpb.Bar {
 	bar := p.AddBar(size,
 		mpb.BarFillerClearOnComplete(),
 		mpb.PrependDecorators(
@@ -287,7 +284,7 @@ func newLayerBar(prefix, onComplete string, size int64) (*mpb.Progress, *mpb.Bar
 	if size <= 0 {
 		bar.SetTotal(0, true)
 	}
-	return p, bar
+	return bar
 }
 
 // ---------------------------------------------------------------------------
@@ -454,35 +451,57 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		return errResp(fmt.Errorf("write config blob: %w", err))
 	}
 
-	// Fetch layers — one mpb.Progress per layer, matching podman's ProgressBar pattern:
-	// a fresh Progress + p.Wait() per layer guarantees the bar goroutine exits and the
-	// final state is committed before we move on, avoiding stale byte-count displays.
+	// Fetch layers in parallel — up to 6 concurrent downloads, matching podman's
+	// default maxParallelDownloads.  All bars share one mpb.Progress; OnComplete
+	// decorators flip each bar to "Pulled   <digest>" when done so the final static
+	// line is always correct regardless of render-tick timing.
+	const maxParallel = 6
+	prog := mpb.New(
+		mpb.WithWidth(80),
+		mpb.WithOutput(os.Stderr),
+		mpb.WithRefreshRate(180*time.Millisecond),
+	)
+	sem := make(chan struct{}, maxParallel)
+	g, gctx := errgroup.WithContext(ctx)
+	var barMu sync.Mutex // serialise bar creation so order matches layer order
 	for _, layer := range manifest.Layers {
+		layer := layer // capture
 		shortDigest := layer.Digest.Hex()
 		if len(shortDigest) > 12 {
 			shortDigest = shortDigest[:12]
 		}
-		// Skip the HTTP connection entirely if the blob is already complete
 		if blobExists(layoutDir, layer) {
-			fmt.Fprintf(os.Stderr, "Cached   %s\n", shortDigest)
+			fmt.Fprintf(prog, "Cached   %s\n", shortDigest)
 			continue
 		}
-		layerRC, err := fetcher.Fetch(ctx, layer)
-		if err != nil {
-			return errResp(fmt.Errorf("fetch layer %s: %w", layer.Digest, err))
-		}
-		p, bar := newLayerBar("Pulling  "+shortDigest, "Pulled   "+shortDigest, layer.Size)
-		proxyRC := bar.ProxyReader(layerRC)
-		_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
-		proxyRC.Close()
-		if writeErr != nil {
-			bar.Abort(false)
-		}
-		p.Wait()
-		if writeErr != nil {
-			return errResp(fmt.Errorf("write layer %s: %w", layer.Digest, writeErr))
-		}
+		// Create the bar before launching the goroutine so bars appear in
+		// manifest order even when downloads finish out of order.
+		barMu.Lock()
+		bar := addLayerBar(prog, "Pulling  "+shortDigest, "Pulled   "+shortDigest, layer.Size)
+		barMu.Unlock()
+		sem <- struct{}{}
+		g.Go(func() error {
+			defer func() { <-sem }()
+			layerRC, err := fetcher.Fetch(gctx, layer)
+			if err != nil {
+				bar.Abort(false)
+				return fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
+			}
+			proxyRC := bar.ProxyReader(layerRC)
+			_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
+			proxyRC.Close()
+			if writeErr != nil {
+				bar.Abort(false)
+				return fmt.Errorf("write layer %s: %w", layer.Digest, writeErr)
+			}
+			return nil
+		})
 	}
+	if err := g.Wait(); err != nil {
+		prog.Wait()
+		return errResp(err)
+	}
+	prog.Wait()
 
 	if err := updateIndex(layoutDir, ref, manifestDesc); err != nil {
 		return errResp(err)

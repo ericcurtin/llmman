@@ -15,6 +15,9 @@ require (
 	// Progress bars
 	github.com/vbauerster/mpb/v8 v8.12.0
 
+	// Parallel layer downloads
+	golang.org/x/sync v0.20.0
+
 	// Podman backend — containers/image transport (same library podman uses)
 	go.podman.io/common v0.67.2-0.20260430110239-06cbc5da36f1
 	go.podman.io/image/v5 v5.39.3-0.20260430110239-06cbc5da36f1
@@ -94,7 +97,6 @@ require (
 	go.podman.io/storage v1.62.1-0.20260427104901-081c2519fc6a // indirect
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/term v0.42.0 // indirect
 	golang.org/x/text v0.36.0 // indirect

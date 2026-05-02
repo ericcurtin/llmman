@@ -214,8 +214,9 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	}()
 
 	_, err = copy.Image(context.Background(), pctx, dstRef, srcRef, &copy.Options{
-		Progress:         ch,
-		ProgressInterval: 200 * time.Millisecond,
+		Progress:             ch,
+		ProgressInterval:     200 * time.Millisecond,
+		MaxParallelDownloads: 6,
 	})
 	close(ch)
 	<-progDone
