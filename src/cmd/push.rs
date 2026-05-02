@@ -17,15 +17,16 @@ pub struct PushArgs {
 
 pub fn run(args: &PushArgs) -> anyhow::Result<()> {
     let store_root = crate::default_store(args.store.as_deref())?;
+    let reference = crate::shortnames::resolve(&args.reference);
     // Verify the image exists locally before attempting push
     let store = crate::storage::OciStore::open(&store_root)?;
-    store.find(&args.reference)?;
+    store.find(&reference)?;
 
     let layout_dir = store_root
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("store path is not valid UTF-8"))?;
 
-    ffi::push(layout_dir, &args.reference)?;
-    println!("Pushed {}", args.reference);
+    ffi::push(layout_dir, &reference)?;
+    println!("Pushed {}", reference);
     Ok(())
 }

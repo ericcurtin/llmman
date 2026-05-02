@@ -419,6 +419,7 @@ async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
 }
 
 async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
+    let model_ref = &crate::shortnames::resolve(model_ref);
     let mut mgr = state.0.manager.lock().await;
     if let Some(m) = mgr.running.get(model_ref) {
         return Ok(m.port);
@@ -1095,7 +1096,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/v1/messages", post(handle_anthropic_messages))
         .with_state(state);
 
-    let addr = "0.0.0.0:11434";
+    let addr = "0.0.0.0:17434";
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;

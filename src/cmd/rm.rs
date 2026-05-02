@@ -20,8 +20,9 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
     let store = OciStore::open(&store_root)?;
 
     let mut any_err = false;
-    for reference in &args.references {
-        match store.remove(reference) {
+    for raw in &args.references {
+        let reference = crate::shortnames::resolve(raw);
+        match store.remove(&reference) {
             Ok(()) => println!("Removed {}", reference),
             Err(e) => {
                 eprintln!("Error removing {}: {}", reference, e);

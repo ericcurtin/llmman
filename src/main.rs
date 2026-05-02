@@ -1,5 +1,6 @@
 mod cmd;
 mod ffi;
+mod shortnames;
 mod storage;
 
 use std::path::{Path, PathBuf};

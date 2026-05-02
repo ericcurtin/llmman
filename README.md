@@ -80,9 +80,8 @@ llmman list
 ```
 
 ```
-REFERENCE                        DIGEST               SIZE
-------------------------------------------------------------------
-registry.example.com/mymodel:v1  sha256:a98f17b4903f  4.2 GiB
+NAME                                      ID                  SIZE          MODIFIED
+hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M    b55c07040368        591 B         just now
 ```
 
 ### Tag

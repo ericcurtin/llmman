@@ -21,19 +21,20 @@ pub struct InspectArgs {
 }
 
 pub fn run(args: &InspectArgs) -> anyhow::Result<()> {
+    let reference = crate::shortnames::resolve(&args.reference);
     if args.remote {
-        let json = ffi::inspect_remote(&args.reference)?;
+        let json = ffi::inspect_remote(&reference)?;
         println!("{}", json);
     } else {
-        inspect_local(args)?;
+        inspect_local(args, &reference)?;
     }
     Ok(())
 }
 
-fn inspect_local(args: &InspectArgs) -> anyhow::Result<()> {
+fn inspect_local(args: &InspectArgs, reference: &str) -> anyhow::Result<()> {
     let store_root = crate::default_store(args.store.as_deref())?;
     let store = OciStore::open(&store_root)?;
-    let desc = store.find(&args.reference)?;
+    let desc = store.find(reference)?;
 
     let manifest = store.read_manifest(&desc.digest)?;
     let out = serde_json::to_string_pretty(&manifest)?;

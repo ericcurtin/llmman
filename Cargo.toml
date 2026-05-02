@@ -21,6 +21,7 @@ chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"
 tar        = "0.4"
 axum       = "0.7"
+toml       = { version = "0.8", default-features = false, features = ["parse"] }
 tokio      = { version = "1", features = ["full"] }
 reqwest    = { version = "0.12", features = ["json", "stream"] }
 futures    = "0.3"

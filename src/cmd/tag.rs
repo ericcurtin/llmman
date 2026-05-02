@@ -23,8 +23,9 @@ pub fn run(args: &TagArgs) -> anyhow::Result<()> {
     let store_root = crate::default_store(args.store.as_deref())?;
     let store = OciStore::open(&store_root)?;
 
-    let desc = store.find(&args.source)?;
+    let source = crate::shortnames::resolve(&args.source);
+    let desc = store.find(&source)?;
     store.tag(desc, &args.target)?;
-    println!("Tagged {} as {}", args.source, args.target);
+    println!("Tagged {} as {}", source, args.target);
     Ok(())
 }

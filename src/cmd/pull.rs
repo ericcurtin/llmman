@@ -21,7 +21,8 @@ pub fn run(args: &PullArgs) -> anyhow::Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("store path is not valid UTF-8"))?;
 
-    ffi::pull(&args.reference, layout_dir)?;
-    println!("Pulled {}", args.reference);
+    let reference = crate::shortnames::resolve(&args.reference);
+    ffi::pull(&reference, layout_dir)?;
+    println!("Pulled {}", reference);
     Ok(())
 }
