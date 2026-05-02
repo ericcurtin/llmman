@@ -572,7 +572,15 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 }
 
 // updateIndex adds or replaces the manifest entry in index.json.
+// An exclusive advisory lock on index.json.lock serialises concurrent callers
+// across processes on Linux, macOS, and Windows.
 func updateIndex(layoutDir, ref string, manifestDesc ocispec.Descriptor) error {
+	lock, err := lockIndex(layoutDir)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+
 	idx, err := readIndex(layoutDir)
 	if err != nil {
 		// New index
@@ -586,7 +594,8 @@ func updateIndex(layoutDir, ref string, manifestDesc ocispec.Descriptor) error {
 	}
 	manifestDesc.Annotations[ocispec.AnnotationRefName] = ref
 
-	// Replace existing entry with same ref name, or append
+	// Replace existing entry with same ref name, or append.
+	// A duplicate digest from a concurrent pull is silently accepted.
 	replaced := false
 	for i, m := range idx.Manifests {
 		if m.Annotations != nil && m.Annotations[ocispec.AnnotationRefName] == ref {
