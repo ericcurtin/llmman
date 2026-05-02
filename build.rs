@@ -47,19 +47,26 @@ fn main() {
         .arg(".");
 
     // On *-pc-windows-msvc targets the Rust linker is MSVC link.exe, so CGO
-    // objects must be MSVC-COFF-compatible.  Three compilers were considered:
+    // objects must be MSVC-COFF-compatible.  Compiler options considered:
     //
     //   MinGW GCC   – accepts GCC flags; produces GNU COFF → link.exe LNK1223
-    //   cl.exe      – MSVC-COFF ✓; rejects -Werror that Go 1.21+ passes → D8021
-    //   clang-cl    – MSVC-COFF ✓; runs in MSVC driver mode, rejects -dM/-fno-stack-protector
-    //   clang       – MSVC-COFF ✓ (on Windows with MSVC env); GCC driver mode,
-    //                 accepts all flags Go passes; VS 2022 ships it for every arch.
+    //   cl.exe      – MSVC-COFF ✓; rejects -Werror from Go 1.21+ → D8021
+    //   clang-cl    – MSVC-COFF ✓; MSVC driver mode rejects -dM/-fno-stack-protector
+    //   clang       – GCC driver mode: accepts all Go flags; produces MSVC-COFF
+    //                 only when --target=*-pc-windows-msvc is explicit.
+    //                 Without it, clang from C:\LLVM\ defaults to MinGW or Linux ABI.
     //
-    // Plain clang (GCC driver mode) is the only option that satisfies both
-    // constraints: it accepts GCC-style flags AND produces MSVC-compatible output
-    // when the MSVC environment is active (ilammy/msvc-dev-cmd sets this up).
+    // Solution: CC=clang + CGO_CFLAGS=--target=<triple> forces MSVC-ABI output
+    // regardless of which clang binary is on PATH or its compiled-in defaults.
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+        let msvc_triple = match arch.as_str() {
+            "x86_64"  => "x86_64-pc-windows-msvc",
+            "aarch64" => "aarch64-pc-windows-msvc",
+            other     => panic!("unsupported Windows arch: {}", other),
+        };
         cmd.env("CC", "clang");
+        cmd.env("CGO_CFLAGS", format!("--target={}", msvc_triple));
     }
 
     // Align the Go shim's minimum macOS version with Rust's aarch64-apple-darwin
