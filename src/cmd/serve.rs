@@ -763,7 +763,11 @@ async fn handle_show(
     State(state): State<AppState>,
     Json(req): Json<OllamaShowRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let model_ref = req.name.as_deref().unwrap_or(&req.model);
+    // ollama sends either {"name":"..."} or {"model":"..."} depending on call site;
+    // filter out empty strings so we always fall back to whichever field is populated.
+    let model_ref = req.name.as_deref().filter(|s| !s.is_empty())
+        .unwrap_or(&req.model);
+    eprintln!("[llmman] /api/show model={model_ref:?}");
     let store = OciStore::open(&state.0.store_path)?;
     let desc = store
         .find(model_ref)
@@ -821,7 +825,8 @@ async fn handle_delete(
     State(state): State<AppState>,
     Json(req): Json<OllamaDeleteRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let model_ref = req.name.as_deref().unwrap_or(&req.model);
+    let model_ref = req.name.as_deref().filter(|s| !s.is_empty())
+        .unwrap_or(&req.model);
     let store = OciStore::open(&state.0.store_path)?;
     store.remove(model_ref)?;
     Ok(StatusCode::OK)
