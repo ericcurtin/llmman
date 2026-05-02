@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -46,27 +47,33 @@ fn main() {
         .arg(&lib_path)
         .arg(".");
 
-    // On *-pc-windows-msvc targets the Rust linker is MSVC link.exe, so CGO
-    // objects must be MSVC-COFF-compatible.  Compiler options considered:
+    // On *-pc-windows-msvc targets the Rust linker (lld-link, set via
+    // RUSTFLAGS in CI) requires MSVC-ABI COFF objects from Go's CGO.
     //
-    //   MinGW GCC   – accepts GCC flags; produces GNU COFF → link.exe LNK1223
-    //   cl.exe      – MSVC-COFF ✓; rejects -Werror from Go 1.21+ → D8021
-    //   clang-cl    – MSVC-COFF ✓; MSVC driver mode rejects -dM/-fno-stack-protector
-    //   clang       – GCC driver mode: accepts all Go flags; produces MSVC-COFF
-    //                 only when --target=*-pc-windows-msvc is explicit.
-    //                 Without it, clang from C:\LLVM\ defaults to MinGW or Linux ABI.
+    // clang in GCC-driver mode is the only C compiler that:
+    //   • accepts all GCC-style flags Go passes (-Werror, -dM, -fno-stack-protector)
+    //   • produces MSVC-compatible COFF when given the right --target
     //
-    // Solution: CC=clang + CGO_CFLAGS=--target=<triple> forces MSVC-ABI output
-    // regardless of which clang binary is on PATH or its compiled-in defaults.
+    // We cannot rely on CGO_CFLAGS to pass --target because Go's CGO security
+    // filter may strip unrecognised flags before they reach clang.  Instead we
+    // write a tiny .cmd wrapper that hard-codes --target as part of the CC
+    // command itself; this is unconditional and cannot be filtered out.
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
         let msvc_triple = match arch.as_str() {
             "x86_64"  => "x86_64-pc-windows-msvc",
             "aarch64" => "aarch64-pc-windows-msvc",
-            other     => panic!("unsupported Windows arch: {}", other),
+            other     => panic!("unsupported Windows MSVC arch: {}", other),
         };
-        cmd.env("CC", "clang");
-        cmd.env("CGO_CFLAGS", format!("--target={}", msvc_triple));
+        // The wrapper calls clang with a fixed --target then forwards all other
+        // args (%*).  Go treats this .cmd as the C compiler.
+        let wrapper = out_dir.join("cgo_cc.cmd");
+        fs::write(
+            &wrapper,
+            format!("@echo off\r\nclang --target={} %*\r\n", msvc_triple),
+        )
+        .expect("write CGO CC wrapper");
+        cmd.env("CC", &wrapper);
     }
 
     // Align the Go shim's minimum macOS version with Rust's aarch64-apple-darwin
