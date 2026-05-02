@@ -47,14 +47,19 @@ fn main() {
         .arg(".");
 
     // On *-pc-windows-msvc targets the Rust linker is MSVC link.exe, so CGO
-    // objects must also be produced by an MSVC-compatible compiler.
-    // MinGW GCC emits a subtly different COFF format that link.exe rejects
-    // with LNK1223.  cl.exe fixes the format but rejects GCC-style flags
-    // (e.g. -Werror) that Go 1.21+ passes from runtime/cgo.
-    // clang-cl is the right tool: it accepts GCC-style flags AND produces
-    // MSVC-compatible COFF objects.  VS 2022 ships clang-cl for all targets.
+    // objects must be MSVC-COFF-compatible.  Three compilers were considered:
+    //
+    //   MinGW GCC   – accepts GCC flags; produces GNU COFF → link.exe LNK1223
+    //   cl.exe      – MSVC-COFF ✓; rejects -Werror that Go 1.21+ passes → D8021
+    //   clang-cl    – MSVC-COFF ✓; runs in MSVC driver mode, rejects -dM/-fno-stack-protector
+    //   clang       – MSVC-COFF ✓ (on Windows with MSVC env); GCC driver mode,
+    //                 accepts all flags Go passes; VS 2022 ships it for every arch.
+    //
+    // Plain clang (GCC driver mode) is the only option that satisfies both
+    // constraints: it accepts GCC-style flags AND produces MSVC-compatible output
+    // when the MSVC environment is active (ilammy/msvc-dev-cmd sets this up).
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        cmd.env("CC", "clang-cl");
+        cmd.env("CC", "clang");
     }
 
     // Align the Go shim's minimum macOS version with Rust's aarch64-apple-darwin
