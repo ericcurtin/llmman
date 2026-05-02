@@ -430,6 +430,20 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		ref = ref + ":latest"
 	}
 
+	// Detect backend: probe the host to decide OCI registry vs HuggingFace-compatible.
+	// Known OCI hosts skip the probe; known HF hosts go straight to HF.
+	// Unknown hosts are probed via the OCI Distribution /v2/ endpoint.
+	host := strings.SplitN(ref, "/", 2)[0]
+	if !isKnownOCIHost(host) {
+		probeClient := &http.Client{Timeout: 5 * time.Second}
+		if isKnownHFHost(host) || !isOCIRegistry(ctx, probeClient, host) {
+			if err := pullHF(ctx, ref, layoutDir); err != nil {
+				return errResp(err)
+			}
+			return okResp("")
+		}
+	}
+
 	if err := ensureLayout(layoutDir); err != nil {
 		return errResp(fmt.Errorf("init OCI layout: %w", err))
 	}
