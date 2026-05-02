@@ -498,6 +498,11 @@ async fn stream_ollama_chat(
         .send()
         .await
         .context("send to llama-server")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+    }
 
     let stream = resp.bytes_stream().map(move |chunk| {
         let data = chunk.unwrap_or_default();
@@ -571,6 +576,11 @@ async fn stream_ollama_generate(
         .send()
         .await
         .context("send to llama-server")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+    }
 
     let stream = resp.bytes_stream().map(move |chunk| {
         let data = chunk.unwrap_or_default();
@@ -638,6 +648,11 @@ async fn stream_anthropic(
         .send()
         .await
         .context("send to llama-server")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+    }
 
     let msg_id = gen_id();
     let msg_id2 = msg_id.clone();
