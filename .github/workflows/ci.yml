@@ -38,11 +38,14 @@ jobs:
             binary: llmman
 
           # ── Windows x86_64 ────────────────────────────────────────────────
+          # lld-link is used instead of MSVC link.exe: it accepts clang's
+          # .pdata format (fixing LNK1223) and GNU ar archives (fixing LNK4003).
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             binary: llmman.exe
             msvc-arch: amd64
+            rustflags: "-C linker=lld-link"
 
           # ── Windows aarch64 ───────────────────────────────────────────────
           - target: aarch64-pc-windows-msvc
@@ -50,6 +53,7 @@ jobs:
             go-os: windows
             binary: llmman.exe
             msvc-arch: arm64
+            rustflags: "-C linker=lld-link"
 
     steps:
       - uses: actions/checkout@v4
@@ -100,12 +104,16 @@ jobs:
       # ── Build (Docker backend, default) ───────────────────────────────────
       - name: Build (docker backend)
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # ── Build (Podman backend) ────────────────────────────────────────────
       # Skipped on Windows: containers/image has no Windows support.
       - name: Build (podman backend)
         if: runner.os != 'Windows'
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # ── Upload artefacts ──────────────────────────────────────────────────
       - name: Upload binary (docker)
