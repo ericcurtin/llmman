@@ -138,8 +138,7 @@ Default locations:
 
 | OS | Path |
 |----|------|
-| Linux | `~/.local/share/llmman/store` |
-| macOS | `~/Library/Application Support/llmman/store` |
+| Linux, macOS | `~/.local/share/llmman/store` |
 | Windows | `%LOCALAPPDATA%\llmman\store` |
 
 The store uses the [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) format, so it is readable by `docker`, `podman`, and `skopeo` directly.
@@ -173,20 +172,3 @@ Each file in the source directory becomes a separate uncompressed tar layer (`ap
 
 This structure is intentionally simple and compatible with any OCI-compliant tool.
 
-## CI
-
-GitHub Actions builds natively on all five supported targets on every push and pull request:
-
-| Target | Runner |
-|--------|--------|
-| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` |
-| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
-| `aarch64-apple-darwin` | `macos-15` |
-| `x86_64-pc-windows-msvc` | `windows-2025` |
-| `aarch64-pc-windows-msvc` | `windows-11-arm` |
-
-Tag pushes matching `v*` additionally publish a GitHub Release with all five binaries attached.
-
-## License
-
-Apache-2.0 — see [LICENSE](LICENSE).
