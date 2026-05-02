@@ -388,13 +388,33 @@ impl OciStore {
 // ---------------------------------------------------------------------------
 
 /// Returns true if the descriptor's ref annotation matches `reference`.
-/// Supports exact match (full ref) or tag-only match for convenience.
+///
+/// Three strategies are tried in order:
+/// 1. Exact match (`"reg/repo:tag"` == `"reg/repo:tag"`)
+/// 2. Tag-only match (`"latest"` matches `"reg/repo:latest"`)
+/// 3. Tagless match: if `reference` has no tag, implicitly append `:latest`
+///    so `"reg/repo"` matches `"reg/repo:latest"`
 fn ref_matches(desc: &Descriptor, reference: &str) -> bool {
-    desc.annotations
+    let stored = match desc
+        .annotations
         .as_ref()
         .and_then(|a| a.get("org.opencontainers.image.ref.name"))
-        .map(|stored| stored == reference || tag_from_ref(stored) == reference)
-        .unwrap_or(false)
+    {
+        Some(s) => s,
+        None => return false,
+    };
+
+    if stored == reference || tag_from_ref(stored) == reference {
+        return true;
+    }
+
+    // If reference carries no tag (no ':' after the last '/'), try `:latest`.
+    let after_slash = &reference[reference.rfind('/').unwrap_or(0)..];
+    if !after_slash.contains(':') && stored.as_str() == format!("{reference}:latest") {
+        return true;
+    }
+
+    false
 }
 
 fn split_digest(digest: &str) -> anyhow::Result<(&str, &str)> {
