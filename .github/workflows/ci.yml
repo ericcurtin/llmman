@@ -48,12 +48,18 @@ jobs:
             rustflags: "-C linker=lld-link"
 
           # ── Windows aarch64 ───────────────────────────────────────────────
+          # ARM64 uses the MSVC-native link.exe (put first in PATH by
+          # ilammy/msvc-dev-cmd) rather than lld-link: the lld-link in
+          # C:\Program Files\LLVM\bin on the ARM64 runner is an x86_64
+          # binary running under emulation; it opens ARM64 archives but
+          # silently ignores ARM64 COFF objects (machine type mismatch),
+          # reporting every CGO export as an undefined symbol.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
             binary: llmman.exe
             msvc-arch: arm64
-            rustflags: "-C linker=lld-link"
+            rustflags: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +107,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y gcc
 
+      # ── Diagnostics: show which C/linker tools will be used (Windows) ───────
+      - name: Show Windows toolchain info
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Write-Host "=== clang ===" ; where.exe clang ; clang --version 2>&1 | Select-Object -First 1
+          Write-Host "=== lld-link ===" ; where.exe lld-link 2>&1 ; (Get-Command lld-link -ErrorAction SilentlyContinue)?.Source
+          Write-Host "=== link ===" ; where.exe link 2>&1 | Select-Object -First 1
+
       # ── Build (Docker backend, default) ───────────────────────────────────
       - name: Build (docker backend)
         run: cargo build --release --target ${{ matrix.target }}
@@ -114,6 +129,20 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+
+      # ── Diagnostics: inspect the Go shim library on Windows ARM64 ───────────
+      - name: Inspect shim library (Windows aarch64)
+        if: always() && matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $lib = Get-ChildItem -Recurse -Path "target" -Filter "llmman_shim.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($lib) {
+            Write-Host "Found: $($lib.FullName) ($($lib.Length) bytes)"
+            dumpbin /HEADERS "$($lib.FullName)" 2>&1 | Select-Object -First 20
+            dumpbin /EXPORTS "$($lib.FullName)" 2>&1 | Select-String "llmman"
+          } else {
+            Write-Host "llmman_shim.lib NOT FOUND"
+          }
 
       # ── Upload artefacts ──────────────────────────────────────────────────
       - name: Upload binary (docker)
