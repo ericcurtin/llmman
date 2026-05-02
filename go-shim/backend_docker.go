@@ -436,11 +436,7 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		}
 		// Skip the HTTP connection entirely if the blob is already complete
 		if blobExists(layoutDir, layer) {
-			bar := prog.AddBar(layer.Size,
-				mpb.PrependDecorators(decor.Name("Cached   "+shortDigest)),
-				mpb.AppendDecorators(decor.CountersKibiByte("% .2f / % .2f")),
-			)
-			bar.SetTotal(layer.Size, true)
+			fmt.Fprintf(prog, "Cached   %s\n", shortDigest)
 			continue
 		}
 		layerRC, err := fetcher.Fetch(ctx, layer)
@@ -455,17 +451,20 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 			mpb.AppendDecorators(
 				decor.CountersKibiByte("% .2f / % .2f"),
 				decor.Name(" "),
-				decor.EwmaSpeed(decor.SizeB1024(0), "% .2f/s", 60),
+				decor.AverageSpeed(decor.SizeB1024(0), "% .2f"),
 			),
 		)
 		proxyRC := bar.ProxyReader(layerRC)
-		_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
+		desc, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
 		proxyRC.Close()
 		if writeErr != nil {
 			bar.Abort(false)
 			prog.Wait()
 			return errResp(fmt.Errorf("write layer %s: %w", layer.Digest, writeErr))
 		}
+		// Defensive: ensure the bar reflects the actual byte count even when
+		// the download completes faster than mpb's 150ms render tick.
+		bar.SetCurrent(desc.Size)
 	}
 	prog.Wait()
 

@@ -159,14 +159,9 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	}
 	defer pctx.Destroy()
 
-	type barState struct {
-		bar    *mpb.Bar
-		last   time.Time
-		offset int64
-	}
 	prog := mpb.New(mpb.WithOutput(os.Stderr))
 	ch := make(chan types.ProgressProperties)
-	states := make(map[string]*barState)
+	bars := make(map[string]*mpb.Bar)
 	progDone := make(chan struct{})
 	go func() {
 		defer close(progDone)
@@ -182,33 +177,29 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 				if len(short) > 12 {
 					short = short[:12]
 				}
-				bar := prog.AddBar(total,
+				bars[key] = prog.AddBar(total,
 					mpb.PrependDecorators(
 						decor.Name("Pulling "+short),
 					),
 					mpb.AppendDecorators(
 						decor.CountersKibiByte("% .2f / % .2f"),
 						decor.Name(" "),
-						decor.EwmaSpeed(decor.SizeB1024(0), "% .2f/s", 60),
+						decor.AverageSpeed(decor.SizeB1024(0), "% .2f"),
 					),
 				)
-				states[key] = &barState{bar: bar, last: time.Now()}
 			case types.ProgressEventRead:
-				if s, ok := states[key]; ok {
-					now := time.Now()
-					s.bar.EwmaIncrInt64(int64(p.OffsetUpdate), now.Sub(s.last))
-					s.offset += int64(p.OffsetUpdate)
-					s.last = now
+				if bar, ok := bars[key]; ok {
+					bar.IncrInt64(int64(p.OffsetUpdate))
 				}
 			case types.ProgressEventDone:
-				if s, ok := states[key]; ok {
-					s.bar.SetTotal(int64(p.Offset), true)
-					delete(states, key)
+				if bar, ok := bars[key]; ok {
+					bar.SetTotal(int64(p.Offset), true)
+					delete(bars, key)
 				}
 			case types.ProgressEventSkipped:
-				if s, ok := states[key]; ok {
-					s.bar.Abort(true)
-					delete(states, key)
+				if bar, ok := bars[key]; ok {
+					bar.Abort(true)
+					delete(bars, key)
 				}
 			}
 		}
