@@ -3,6 +3,56 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Extract every object from a (possibly GNU ar) static archive and repack
+/// it as an MSVC-format LIB using lib.exe.  This is needed on Windows ARM64
+/// because Go uses GNU 'ar' when it can't identify the C compiler as cl.exe,
+/// but MSVC link.exe only accepts its own LIB format.
+fn repack_as_msvc_lib(lib_path: &PathBuf, out_dir: &PathBuf) {
+    let extract_dir = out_dir.join("ar_extract");
+    let _ = fs::remove_dir_all(&extract_dir);
+    if fs::create_dir_all(&extract_dir).is_err() {
+        return;
+    }
+
+    // llvm-ar can read both GNU ar and MSVC LIB archives
+    let ok = Command::new("llvm-ar")
+        .args(["x", lib_path.to_str().unwrap_or("")])
+        .current_dir(&extract_dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("cargo:warning=llvm-ar extraction failed; keeping original archive");
+        return;
+    }
+
+    let objs: Vec<PathBuf> = match fs::read_dir(&extract_dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+        Err(_) => return,
+    };
+    if objs.is_empty() {
+        return;
+    }
+
+    // lib.exe is the ARM64-native MSVC archiver; it infers machine type from objects
+    let tmp = out_dir.join("_shim_repack.lib");
+    let mut cmd = Command::new("lib.exe");
+    cmd.arg("/nologo").arg(format!("/out:{}", tmp.display()));
+    for obj in &objs {
+        if let Some(s) = obj.to_str() {
+            cmd.arg(s);
+        }
+    }
+
+    if cmd.status().map(|s| s.success()).unwrap_or(false) {
+        let _ = fs::rename(&tmp, lib_path);
+        println!("cargo:warning=Repacked Go archive as MSVC LIB (ARM64)");
+    } else {
+        eprintln!("cargo:warning=lib.exe repack failed; keeping original archive");
+    }
+    let _ = fs::remove_dir_all(&extract_dir);
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -90,6 +140,22 @@ fn main() {
 
     if !status.success() {
         panic!("Go shim build failed for tags={}", go_tags);
+    }
+
+    // On Windows MSVC + aarch64: Go doesn't recognise our clang wrapper as
+    // MSVC (it checks the binary name for "cl.exe"), so it archives the CGO
+    // objects with GNU 'ar' instead of MSVC 'lib.exe'.  GNU ar archives are
+    // rejected by MSVC link.exe with LNK4003.
+    //
+    // Fix: extract every object from the archive with llvm-ar (which reads
+    // both GNU ar and MSVC LIB), then repack with the ARM64-native lib.exe
+    // to produce a proper MSVC LIB.  lib.exe infers the machine type from
+    // the objects so this is safe even when run unconditionally.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+    {
+        repack_as_msvc_lib(&lib_path, &out_dir);
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
