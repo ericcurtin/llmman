@@ -96,13 +96,22 @@ func writeBlob(layoutDir string, mediaType string, data []byte) (ocispec.Descrip
 	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}, nil
 }
 
-// writeBlobStream writes a large stream to the OCI layout blobs directory,
-// computing the digest on-the-fly.  Returns the descriptor with the computed digest.
-func writeBlobStream(layoutDir string, mediaType string, r io.Reader, expectedSize int64) (ocispec.Descriptor, error) {
-	tmp := filepath.Join(layoutDir, "blobs", "tmp-"+fmt.Sprintf("%d", time.Now().UnixNano()))
-	if err := os.MkdirAll(filepath.Join(layoutDir, "blobs"), 0o755); err != nil {
+// writeBlobStream writes a large stream to the OCI layout blobs directory.
+// dgst is the expected digest; the blob is skipped if already complete, and
+// the computed digest is verified against dgst before the file is committed.
+// A deterministic <dest>.part file is used so interrupted downloads are
+// identifiable and do not leave random orphan files.
+func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst digest.Digest) (ocispec.Descriptor, error) {
+	dir := filepath.Join(layoutDir, "blobs", dgst.Algorithm().String())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return ocispec.Descriptor{}, err
 	}
+	dest := filepath.Join(dir, dgst.Hex())
+	// Skip if already complete
+	if fi, err := os.Stat(dest); err == nil && (size <= 0 || fi.Size() == size) {
+		return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: fi.Size()}, nil
+	}
+	tmp := dest + ".part"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return ocispec.Descriptor{}, err
@@ -114,22 +123,25 @@ func writeBlobStream(layoutDir string, mediaType string, r io.Reader, expectedSi
 		os.Remove(tmp)
 		return ocispec.Descriptor{}, err
 	}
-	if expectedSize > 0 && written != expectedSize {
+	if size > 0 && written != size {
 		os.Remove(tmp)
-		return ocispec.Descriptor{}, fmt.Errorf("size mismatch: expected %d got %d", expectedSize, written)
+		return ocispec.Descriptor{}, fmt.Errorf("size mismatch: expected %d got %d", size, written)
 	}
-	dgst := digester.Digest()
-	dir := filepath.Join(layoutDir, "blobs", dgst.Algorithm().String())
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if got := digester.Digest(); got != dgst {
 		os.Remove(tmp)
-		return ocispec.Descriptor{}, err
+		return ocispec.Descriptor{}, fmt.Errorf("digest mismatch: expected %s got %s", dgst, got)
 	}
-	dest := filepath.Join(dir, dgst.Hex())
 	if err := os.Rename(tmp, dest); err != nil {
 		os.Remove(tmp)
 		return ocispec.Descriptor{}, err
 	}
 	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: written}, nil
+}
+
+// blobExists reports whether a blob is already fully stored in the layout.
+func blobExists(layoutDir string, desc ocispec.Descriptor) bool {
+	fi, err := os.Stat(blobPath(layoutDir, desc.Digest))
+	return err == nil && fi.Size() == desc.Size
 }
 
 // readIndex reads index.json from an OCI layout directory.
@@ -418,18 +430,27 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	// Fetch layers with progress bars
 	prog := mpb.New(mpb.WithOutput(os.Stderr))
 	for _, layer := range manifest.Layers {
+		shortDigest := layer.Digest.Hex()
+		if len(shortDigest) > 12 {
+			shortDigest = shortDigest[:12]
+		}
+		// Skip the HTTP connection entirely if the blob is already complete
+		if blobExists(layoutDir, layer) {
+			bar := prog.AddBar(layer.Size,
+				mpb.PrependDecorators(decor.Name("Cached   "+shortDigest)),
+				mpb.AppendDecorators(decor.CountersKibiByte("% .2f / % .2f")),
+			)
+			bar.SetTotal(layer.Size, true)
+			continue
+		}
 		layerRC, err := fetcher.Fetch(ctx, layer)
 		if err != nil {
 			prog.Wait()
 			return errResp(fmt.Errorf("fetch layer %s: %w", layer.Digest, err))
 		}
-		shortDigest := layer.Digest.Hex()
-		if len(shortDigest) > 12 {
-			shortDigest = shortDigest[:12]
-		}
 		bar := prog.AddBar(layer.Size,
 			mpb.PrependDecorators(
-				decor.Name(fmt.Sprintf("Pulling %s", shortDigest)),
+				decor.Name("Pulling  "+shortDigest),
 			),
 			mpb.AppendDecorators(
 				decor.CountersKibiByte("% .2f / % .2f"),
@@ -438,7 +459,7 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 			),
 		)
 		proxyRC := bar.ProxyReader(layerRC)
-		_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size)
+		_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest)
 		proxyRC.Close()
 		if writeErr != nil {
 			bar.Abort(false)
