@@ -12,6 +12,9 @@ require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 
+	// Progress bars
+	github.com/vbauerster/mpb/v8 v8.12.0
+
 	// Podman backend — containers/image transport (same library podman uses)
 	go.podman.io/common v0.67.2-0.20260430110239-06cbc5da36f1
 	go.podman.io/image/v5 v5.39.3-0.20260430110239-06cbc5da36f1
@@ -83,7 +86,6 @@ require (
 	github.com/tchap/go-patricia/v2 v2.3.3 // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/vbatts/tar-split v0.12.2 // indirect
-	github.com/vbauerster/mpb/v8 v8.12.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect

@@ -29,6 +29,8 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
 // ---------------------------------------------------------------------------
@@ -356,6 +358,11 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	layoutDir := C.GoString(cLayoutDir)
 	ctx := context.Background()
 
+	// Normalize: append :latest if reference has no tag or digest
+	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
+		ref = ref + ":latest"
+	}
+
 	if err := ensureLayout(layoutDir); err != nil {
 		return errResp(fmt.Errorf("init OCI layout: %w", err))
 	}
@@ -408,18 +415,38 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		return errResp(fmt.Errorf("write config blob: %w", err))
 	}
 
-	// Fetch layers (streamed to avoid large allocations)
+	// Fetch layers with progress bars
+	prog := mpb.New(mpb.WithOutput(os.Stderr))
 	for _, layer := range manifest.Layers {
 		layerRC, err := fetcher.Fetch(ctx, layer)
 		if err != nil {
+			prog.Wait()
 			return errResp(fmt.Errorf("fetch layer %s: %w", layer.Digest, err))
 		}
-		_, writeErr := writeBlobStream(layoutDir, layer.MediaType, layerRC, layer.Size)
-		layerRC.Close()
+		shortDigest := layer.Digest.Hex()
+		if len(shortDigest) > 12 {
+			shortDigest = shortDigest[:12]
+		}
+		bar := prog.AddBar(layer.Size,
+			mpb.PrependDecorators(
+				decor.Name(fmt.Sprintf("Pulling %s", shortDigest)),
+			),
+			mpb.AppendDecorators(
+				decor.CountersKibiByte("% .2f / % .2f"),
+				decor.Name(" "),
+				decor.EwmaSpeed(decor.SizeB1024(0), "% .2f/s", 60),
+			),
+		)
+		proxyRC := bar.ProxyReader(layerRC)
+		_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size)
+		proxyRC.Close()
 		if writeErr != nil {
+			bar.Abort(false)
+			prog.Wait()
 			return errResp(fmt.Errorf("write layer %s: %w", layer.Digest, writeErr))
 		}
 	}
+	prog.Wait()
 
 	if err := updateIndex(layoutDir, ref, manifestDesc); err != nil {
 		return errResp(err)

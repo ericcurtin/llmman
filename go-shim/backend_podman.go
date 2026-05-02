@@ -15,7 +15,10 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	commonauth "go.podman.io/common/pkg/auth"
 	"go.podman.io/image/v5/copy"
 	"go.podman.io/image/v5/signature"
@@ -123,6 +126,12 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	ref := C.GoString(cRef)
 	layoutDir := C.GoString(cLayoutDir)
+
+	// Normalize: append :latest if reference has no tag or digest
+	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
+		ref = ref + ":latest"
+	}
+
 	tag := tagFromRef(ref)
 
 	// Source: Docker registry
@@ -150,9 +159,69 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	}
 	defer pctx.Destroy()
 
+	type barState struct {
+		bar    *mpb.Bar
+		last   time.Time
+		offset int64
+	}
+	prog := mpb.New(mpb.WithOutput(os.Stderr))
+	ch := make(chan types.ProgressProperties)
+	states := make(map[string]*barState)
+	progDone := make(chan struct{})
+	go func() {
+		defer close(progDone)
+		for p := range ch {
+			key := p.Artifact.Digest.String()
+			switch p.Event {
+			case types.ProgressEventNewArtifact:
+				total := p.Artifact.Size
+				if total < 0 {
+					total = 0
+				}
+				short := p.Artifact.Digest.Hex()
+				if len(short) > 12 {
+					short = short[:12]
+				}
+				bar := prog.AddBar(total,
+					mpb.PrependDecorators(
+						decor.Name("Pulling "+short),
+					),
+					mpb.AppendDecorators(
+						decor.CountersKibiByte("% .2f / % .2f"),
+						decor.Name(" "),
+						decor.EwmaSpeed(decor.SizeB1024(0), "% .2f/s", 60),
+					),
+				)
+				states[key] = &barState{bar: bar, last: time.Now()}
+			case types.ProgressEventRead:
+				if s, ok := states[key]; ok {
+					now := time.Now()
+					s.bar.EwmaIncrInt64(int64(p.OffsetUpdate), now.Sub(s.last))
+					s.offset += int64(p.OffsetUpdate)
+					s.last = now
+				}
+			case types.ProgressEventDone:
+				if s, ok := states[key]; ok {
+					s.bar.SetTotal(int64(p.Offset), true)
+					delete(states, key)
+				}
+			case types.ProgressEventSkipped:
+				if s, ok := states[key]; ok {
+					s.bar.Abort(true)
+					delete(states, key)
+				}
+			}
+		}
+	}()
+
 	_, err = copy.Image(context.Background(), pctx, dstRef, srcRef, &copy.Options{
-		ReportWriter: os.Stderr,
+		Progress:         ch,
+		ProgressInterval: 200 * time.Millisecond,
 	})
+	close(ch)
+	<-progDone
+	prog.Wait()
+
 	if err != nil {
 		return errResp(fmt.Errorf("copy image: %w", err))
 	}
