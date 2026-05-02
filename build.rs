@@ -8,9 +8,15 @@ fn main() {
     let shim_dir = manifest_dir.join("go-shim");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    // Determine backend from Cargo features
-    let backend = if env::var("CARGO_FEATURE_PODMAN").is_ok() {
-        "podman"
+    // Determine backend build tags from Cargo features.
+    // For the podman backend we add two extra tags to avoid pulling in C library
+    // dependencies (libgpgme, libbtrfs, libdevmapper) that are not present on CI
+    // runners and are not needed for the docker:// and oci: transports we use:
+    //   containers_image_openpgp  — use Go's native OpenPGP instead of libgpgme
+    //   exclude_graphdriver_btrfs — omit the btrfs storage driver (needs libbtrfs-dev)
+    //   exclude_graphdriver_devicemapper — omit the device-mapper driver
+    let go_tags = if env::var("CARGO_FEATURE_PODMAN").is_ok() {
+        "podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper"
     } else {
         "docker"
     };
@@ -34,7 +40,7 @@ fn main() {
         .current_dir(&shim_dir)
         .env("CGO_ENABLED", "1")
         .arg("build")
-        .arg(format!("-tags={}", backend))
+        .arg(format!("-tags={}", go_tags))
         .arg("-buildmode=c-archive")
         .arg("-o")
         .arg(&lib_path)
@@ -43,7 +49,7 @@ fn main() {
         .expect("Failed to invoke `go build` — is Go (1.22+) installed and on PATH?");
 
     if !status.success() {
-        panic!("Go shim build failed for backend={}", backend);
+        panic!("Go shim build failed for tags={}", go_tags);
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -64,6 +70,9 @@ fn main() {
             println!("cargo:rustc-link-lib=bcrypt");
             println!("cargo:rustc-link-lib=ws2_32");
             println!("cargo:rustc-link-lib=userenv");
+            // CGO object files compiled with MSVC reference fprintf and friends via
+            // the legacy stdio shim; without this the linker emits LNK2019.
+            println!("cargo:rustc-link-lib=legacy_stdio_definitions");
         }
         _ => {}
     }

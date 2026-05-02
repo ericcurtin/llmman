@@ -42,12 +42,14 @@ jobs:
             runner: windows-2025
             go-os: windows
             binary: llmman.exe
+            msvc-arch: amd64
 
           # ── Windows aarch64 ───────────────────────────────────────────────
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
             binary: llmman.exe
+            msvc-arch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -80,14 +82,18 @@ jobs:
           key: go-${{ matrix.go-os }}-${{ hashFiles('go-shim/go.sum') }}
           restore-keys: go-${{ matrix.go-os }}-
 
-      # ── Windows: ensure MSVC C compiler is on PATH ────────────────────────
-      # CGO on Windows requires a C compiler; Visual Studio ships cl.exe.
+      # ── Windows: set up MSVC with the correct target architecture ─────────
+      # msvc-arch is explicit in the matrix so the ARM64 runner gets the ARM64
+      # toolchain rather than the default x64, which would cause the wrong
+      # assembler to be used when CGO compiles Go's ARM64 runtime stubs.
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc-arch }}
 
-      # ── Linux: install C toolchain if needed ──────────────────────────────
-      - name: Install C toolchain (Linux)
+      # ── Linux: C compiler (always needed for CGO) ─────────────────────────
+      - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y gcc
 
@@ -96,7 +102,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       # ── Build (Podman backend) ────────────────────────────────────────────
-      # Skip on Windows: podman's containers/image has limited Windows support.
+      # Skipped on Windows: containers/image has no Windows support.
       - name: Build (podman backend)
         if: runner.os != 'Windows'
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
