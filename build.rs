@@ -36,15 +36,33 @@ fn main() {
         .args(["mod", "download"])
         .status();
 
-    let status = Command::new("go")
-        .current_dir(&shim_dir)
+    let mut cmd = Command::new("go");
+    cmd.current_dir(&shim_dir)
         .env("CGO_ENABLED", "1")
         .arg("build")
         .arg(format!("-tags={}", go_tags))
         .arg("-buildmode=c-archive")
         .arg("-o")
         .arg(&lib_path)
-        .arg(".")
+        .arg(".");
+
+    // On *-pc-windows-msvc targets the Rust linker is MSVC link.exe, so CGO
+    // objects must also be produced by cl.exe (not MinGW GCC, which emits a
+    // subtly different COFF format that link.exe rejects with LNK1223).
+    // ilammy/msvc-dev-cmd puts cl.exe on PATH; we just need to tell Go to use it.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        cmd.env("CC", "cl");
+    }
+
+    // Align the Go shim's minimum macOS version with Rust's aarch64-apple-darwin
+    // deployment target (11.0).  Without this Go defaults to the SDK version
+    // (15.x on macos-15 runners), producing objects that emit "built for newer
+    // macOS" warnings and may reference symbols gated behind the newer version.
+    if target_os == "macos" {
+        cmd.env("MACOSX_DEPLOYMENT_TARGET", "11.0");
+    }
+
+    let status = cmd
         .status()
         .expect("Failed to invoke `go build` — is Go (1.22+) installed and on PATH?");
 
@@ -65,14 +83,17 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=CoreFoundation");
             println!("cargo:rustc-link-lib=framework=Security");
             println!("cargo:rustc-link-lib=framework=SystemConfiguration");
+            // The podman backend (and Go's CGO net resolver in general) references
+            // res_9_ninit / res_9_nclose / res_9_nsearch from libresolv.
+            println!("cargo:rustc-link-lib=resolv");
         }
         "windows" => {
             println!("cargo:rustc-link-lib=bcrypt");
             println!("cargo:rustc-link-lib=ws2_32");
             println!("cargo:rustc-link-lib=userenv");
-            // CGO object files compiled with MSVC reference fprintf and friends via
-            // the legacy stdio shim; without this the linker emits LNK2019.
-            println!("cargo:rustc-link-lib=legacy_stdio_definitions");
+            // With CC=cl the CGO objects are compiled by MSVC which links the CRT
+            // automatically; legacy_stdio_definitions is not needed and causes
+            // LNK4078 / LNK1223 when mixed with MSVC-format objects.
         }
         _ => {}
     }
