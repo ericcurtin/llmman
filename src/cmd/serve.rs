@@ -291,29 +291,14 @@ fn gen_id() -> String {
 // GGUF resolution – find and extract the model file from the OCI store
 // ---------------------------------------------------------------------------
 
+// Media type used by HuggingFace GGUF blobs — the blob IS the raw GGUF file.
+const HF_GGUF_MEDIA_TYPE: &str = "application/vnd.docker.ai.gguf.v3";
+
 fn resolve_gguf(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow::Result<PathBuf> {
     let store = OciStore::open(store_path)?;
     let desc = store
         .find(model_ref)
         .with_context(|| format!("model not found in store: {model_ref}"))?;
-
-    // Cache key based on manifest digest
-    let (_, hex) = desc
-        .digest
-        .split_once(':')
-        .ok_or_else(|| anyhow!("malformed digest: {}", desc.digest))?;
-    let cached_dir = cache_path.join(hex);
-
-    // Return existing cached GGUF if present
-    if cached_dir.exists() {
-        for entry in std::fs::read_dir(&cached_dir)?.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                return Ok(p);
-            }
-        }
-    }
-    std::fs::create_dir_all(&cached_dir)?;
 
     let manifest = store.read_manifest(&desc.digest)?;
 
@@ -337,11 +322,42 @@ fn resolve_gguf(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow
         .cloned()
         .unwrap_or_else(|| "model.gguf".into());
 
+    let (_, layer_hex) = gguf_layer
+        .digest
+        .split_once(':')
+        .ok_or_else(|| anyhow!("malformed digest: {}", gguf_layer.digest))?;
+
+    // Fast path: HF blobs are raw GGUF files stored directly in the blob store.
+    // No extraction needed — hand the blob path straight to llama-server.
+    if gguf_layer.media_type == HF_GGUF_MEDIA_TYPE {
+        let blob_path = store_path
+            .join("blobs")
+            .join("sha256")
+            .join(layer_hex);
+        if blob_path.exists() {
+            eprintln!("[llmman] using blob directly: {}", blob_path.display());
+            return Ok(blob_path);
+        }
+    }
+
+    // Slow path: layer is a tar archive (llmman build images).
+    // Extract the .gguf entry to a content-addressed cache directory.
+    let cached_dir = cache_path.join(layer_hex);
+    if cached_dir.exists() {
+        for entry in std::fs::read_dir(&cached_dir)?.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                return Ok(p);
+            }
+        }
+    }
+    std::fs::create_dir_all(&cached_dir)?;
+
     let blob = store
         .read_blob(&gguf_layer.digest)
         .with_context(|| format!("read blob {}", gguf_layer.digest))?;
 
-    // Detect: raw GGUF (magic "GGUF") or tar containing a GGUF
+    // Detect: raw GGUF (magic bytes) or tar
     let dest = if blob.len() >= 4 && &blob[..4] == b"GGUF" {
         let name = Path::new(&title)
             .file_name()
@@ -350,7 +366,6 @@ fn resolve_gguf(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow
         std::fs::write(&p, &blob)?;
         p
     } else {
-        // Try to extract GGUF from the tar layer
         let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
         let mut extracted: Option<PathBuf> = None;
         for entry in archive.entries()? {
