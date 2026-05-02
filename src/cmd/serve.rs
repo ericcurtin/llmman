@@ -67,6 +67,7 @@ struct OllamaMessage {
 #[derive(Debug, Deserialize)]
 struct OllamaChatRequest {
     model: String,
+    #[serde(default)]
     messages: Vec<OllamaMessage>,
     #[serde(default = "bool_true")]
     stream: bool,
@@ -76,6 +77,7 @@ struct OllamaChatRequest {
 #[derive(Debug, Deserialize)]
 struct OllamaGenerateRequest {
     model: String,
+    #[serde(default)]
     prompt: String,
     #[serde(default = "bool_true")]
     stream: bool,
@@ -777,6 +779,44 @@ async fn handle_show(
     }))
 }
 
+// -- Ollama /api/pull ---------------------------------------------------------
+// Clients (e.g. `ollama run`) call this to pull a model.  We don't download
+// anything here — the model must already be in the local store — but we need
+// to return a valid streaming success response so the client proceeds.
+
+#[derive(Debug, Deserialize)]
+struct OllamaPullRequest {
+    model: String,
+    #[serde(alias = "name", default)]
+    _name: String,
+}
+
+async fn handle_pull(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaPullRequest>,
+) -> impl IntoResponse {
+    let model = crate::shortnames::resolve(&req.model);
+    eprintln!("[llmman] /api/pull model={model:?}");
+    let store = match OciStore::open(&state.0.store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let body = serde_json::json!({"error": format!("{e:#}")});
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body).into_response());
+        }
+    };
+    let found = store.find(&model).is_ok();
+    if found {
+        // Model already in store — stream a single "success" status line.
+        let line = serde_json::json!({"status": "success"}).to_string() + "\n";
+        return (StatusCode::OK, axum::response::Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(line))
+            .unwrap());
+    }
+    let body = serde_json::json!({"error": format!("model not found: {model}")});
+    (StatusCode::NOT_FOUND, Json(body).into_response())
+}
+
 async fn handle_delete(
     State(state): State<AppState>,
     Json(req): Json<OllamaDeleteRequest>,
@@ -793,6 +833,7 @@ async fn handle_ollama_chat(
     State(state): State<AppState>,
     Json(req): Json<OllamaChatRequest>,
 ) -> Result<Response, AppError> {
+    eprintln!("[llmman] /api/chat model={:?} messages={}", req.model, req.messages.len());
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
@@ -846,6 +887,7 @@ async fn handle_ollama_generate(
     State(state): State<AppState>,
     Json(req): Json<OllamaGenerateRequest>,
 ) -> Result<Response, AppError> {
+    eprintln!("[llmman] /api/generate model={:?} prompt_len={}", req.model, req.prompt.len());
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
@@ -1088,6 +1130,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/api/tags", get(handle_tags))
         .route("/api/ps", get(handle_ps))
         .route("/api/show", post(handle_show))
+        .route("/api/pull", post(handle_pull))
         .route("/api/delete", delete(handle_delete))
         .route("/api/chat", post(handle_ollama_chat))
         .route("/api/generate", post(handle_ollama_generate))
