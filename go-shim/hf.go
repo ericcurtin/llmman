@@ -263,14 +263,33 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 // ---------------------------------------------------------------------------
 
 func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layoutDir, owner, repo, commit string, file hfFile) (ocispec.Descriptor, error) {
+	if err := os.MkdirAll(filepath.Join(layoutDir, "blobs"), 0o755); err != nil {
+		return ocispec.Descriptor{}, err
+	}
+
+	// Fast path: HuggingFace OIDs are the SHA-256 of the raw file content,
+	// which is exactly our content-addressed blob store key.  If the blob is
+	// already present with the right size, skip the download entirely.
+	if len(file.OID) == 64 {
+		dest := filepath.Join(layoutDir, "blobs", "sha256", file.OID)
+		if fi, err := os.Stat(dest); err == nil && fi.Size() == file.Size {
+			fmt.Fprintf(os.Stderr, "Cached   %s\n", filepath.Base(file.Path))
+			return ocispec.Descriptor{
+				MediaType: hfGGUFMediaType,
+				Digest:    digest.Digest("sha256:" + file.OID),
+				Size:      file.Size,
+				Annotations: map[string]string{
+					ocispec.AnnotationTitle: filepath.Base(file.Path),
+				},
+			}, nil
+		}
+	}
+
 	// Deterministic temp path keyed by (owner, repo, commit prefix, filename)
 	// so a new commit never reuses bytes from an old one.
 	sanitize := strings.NewReplacer("/", "_", ":", "_", ".", "_")
 	tmpKey := sanitize.Replace(owner + "_" + repo + "_" + commit[:12] + "_" + filepath.Base(file.Path))
 	tmpPath := filepath.Join(layoutDir, "blobs", "hf-"+tmpKey+".part")
-	if err := os.MkdirAll(filepath.Join(layoutDir, "blobs"), 0o755); err != nil {
-		return ocispec.Descriptor{}, err
-	}
 
 	// Detect existing partial download.
 	startOffset := int64(0)
