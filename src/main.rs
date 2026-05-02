@@ -41,6 +41,8 @@ enum Commands {
     Rm(cmd::rm::RmArgs),
     /// Show the manifest of a local (or remote with --remote) image
     Inspect(cmd::inspect::InspectArgs),
+    /// Start an inference server (Ollama / OpenAI / Anthropic compatible APIs)
+    Serve(cmd::serve::ServeArgs),
     /// Create a new local tag pointing to an existing image
     Tag(cmd::tag::TagArgs),
 }
@@ -52,15 +54,16 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
-        Commands::Build(a) => cmd::build::run(a),
-        Commands::Login(a) => cmd::login::run(a),
-        Commands::Logout(a) => cmd::logout::run(a),
-        Commands::Push(a) => cmd::push::run(a),
-        Commands::Pull(a) => cmd::pull::run(a),
-        Commands::List(a) => cmd::list::run(a),
-        Commands::Rm(a) => cmd::rm::run(a),
+        Commands::Build(a)   => cmd::build::run(a),
+        Commands::Login(a)   => cmd::login::run(a),
+        Commands::Logout(a)  => cmd::logout::run(a),
+        Commands::Push(a)    => cmd::push::run(a),
+        Commands::Pull(a)    => cmd::pull::run(a),
+        Commands::List(a)    => cmd::list::run(a),
+        Commands::Rm(a)      => cmd::rm::run(a),
         Commands::Inspect(a) => cmd::inspect::run(a),
-        Commands::Tag(a) => cmd::tag::run(a),
+        Commands::Serve(a)   => cmd::serve::run(a),
+        Commands::Tag(a)     => cmd::tag::run(a),
     };
     if let Err(e) = result {
         eprintln!("Error: {:#}", e);

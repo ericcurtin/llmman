@@ -1,0 +1,1105 @@
+//! `llmman serve` – HTTP server exposing Ollama, OpenAI, and Anthropic-compatible
+//! APIs backed by `llama-server` sub-processes from llama.cpp.
+
+use std::collections::HashMap;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context};
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use clap::Args;
+use futures::StreamExt;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration, Instant};
+
+use crate::default_store;
+use crate::storage::OciStore;
+
+// ---------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct ServeArgs {}
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct AppState(Arc<Inner>);
+
+struct Inner {
+    manager: Mutex<ModelManager>,
+    llama_server_bin: PathBuf,
+    store_path: PathBuf,
+    cache_path: PathBuf,
+    client: Client,
+}
+
+struct ModelManager {
+    running: HashMap<String, RunningModel>,
+}
+
+struct RunningModel {
+    _child: tokio::process::Child,
+    port: u16,
+}
+
+// ---------------------------------------------------------------------------
+// Ollama API types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OllamaMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaChatRequest {
+    model: String,
+    messages: Vec<OllamaMessage>,
+    #[serde(default = "bool_true")]
+    stream: bool,
+    options: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaGenerateRequest {
+    model: String,
+    prompt: String,
+    #[serde(default = "bool_true")]
+    stream: bool,
+    options: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaChatChunk {
+    model: String,
+    created_at: String,
+    message: OllamaMessage,
+    done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    done_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaGenerateChunk {
+    model: String,
+    created_at: String,
+    response: String,
+    done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    done_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaModelInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaModelInfo {
+    name: String,
+    model: String,
+    size: u64,
+    digest: String,
+    modified_at: String,
+    details: OllamaModelDetails,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaModelDetails {
+    format: String,
+    family: String,
+    parameter_size: String,
+    quantization_level: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaPsResponse {
+    models: Vec<OllamaRunningModelInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaRunningModelInfo {
+    name: String,
+    model: String,
+    size: u64,
+    size_vram: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowRequest {
+    model: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaShowResponse {
+    model_info: serde_json::Value,
+    details: OllamaModelDetails,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaDeleteRequest {
+    model: String,
+    name: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic API types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AnthropicRequest {
+    model: String,
+    messages: Vec<AnthropicMessage>,
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    stream: bool,
+    system: Option<String>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicMessage {
+    role: String,
+    content: AnthropicContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AnthropicContent {
+    Text(String),
+    Blocks(Vec<AnthropicBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicBlock {
+    #[serde(rename = "type")]
+    type_: String,
+    text: Option<String>,
+}
+
+impl AnthropicContent {
+    fn as_text(&self) -> String {
+        match self {
+            AnthropicContent::Text(s) => s.clone(),
+            AnthropicContent::Blocks(blocks) => blocks
+                .iter()
+                .filter(|b| b.type_ == "text")
+                .filter_map(|b| b.text.as_deref())
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI types (internal proxy use)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct OAIMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OAIChatRequest {
+    model: String,
+    messages: Vec<OAIMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIChunk {
+    choices: Vec<OAIChunkChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIChunkChoice {
+    delta: OAIChunkDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAIChunkDelta {
+    content: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+struct AppError(anyhow::Error);
+
+impl<E: Into<anyhow::Error>> From<E> for AppError {
+    fn from(e: E) -> Self {
+        Self(e.into())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({ "error": format!("{:#}", self.0) });
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn bool_true() -> bool {
+    true
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn gen_id() -> String {
+    use std::time::SystemTime;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{secs:032x}")
+}
+
+// ---------------------------------------------------------------------------
+// GGUF resolution – find and extract the model file from the OCI store
+// ---------------------------------------------------------------------------
+
+fn resolve_gguf(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow::Result<PathBuf> {
+    let store = OciStore::open(store_path)?;
+    let desc = store
+        .find(model_ref)
+        .with_context(|| format!("model not found in store: {model_ref}"))?;
+
+    // Cache key based on manifest digest
+    let (_, hex) = desc
+        .digest
+        .split_once(':')
+        .ok_or_else(|| anyhow!("malformed digest: {}", desc.digest))?;
+    let cached_dir = cache_path.join(hex);
+
+    // Return existing cached GGUF if present
+    if cached_dir.exists() {
+        for entry in std::fs::read_dir(&cached_dir)?.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                return Ok(p);
+            }
+        }
+    }
+    std::fs::create_dir_all(&cached_dir)?;
+
+    let manifest = store.read_manifest(&desc.digest)?;
+
+    // Find the first layer whose title ends with .gguf
+    let gguf_layer = manifest
+        .layers
+        .iter()
+        .find(|l| {
+            l.annotations
+                .as_ref()
+                .and_then(|a| a.get("org.opencontainers.image.title"))
+                .map(|t| t.ends_with(".gguf"))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| anyhow!("no .gguf layer in model {model_ref}"))?;
+
+    let title = gguf_layer
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("org.opencontainers.image.title"))
+        .cloned()
+        .unwrap_or_else(|| "model.gguf".into());
+
+    let blob = store
+        .read_blob(&gguf_layer.digest)
+        .with_context(|| format!("read blob {}", gguf_layer.digest))?;
+
+    // Detect: raw GGUF (magic "GGUF") or tar containing a GGUF
+    let dest = if blob.len() >= 4 && &blob[..4] == b"GGUF" {
+        let name = Path::new(&title)
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
+        let p = cached_dir.join(name);
+        std::fs::write(&p, &blob)?;
+        p
+    } else {
+        // Try to extract GGUF from the tar layer
+        let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
+        let mut extracted: Option<PathBuf> = None;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let entry_path = entry.path()?.to_path_buf();
+            if entry_path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                let name = entry_path
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
+                let dest = cached_dir.join(name);
+                entry.unpack(&dest)?;
+                extracted = Some(dest);
+                break;
+            }
+        }
+        extracted.ok_or_else(|| anyhow!("no .gguf file found in tar layer of {model_ref}"))?
+    };
+
+    Ok(dest)
+}
+
+// ---------------------------------------------------------------------------
+// Process management
+// ---------------------------------------------------------------------------
+
+fn find_free_port() -> anyhow::Result<u16> {
+    let l = TcpListener::bind("127.0.0.1:0")?;
+    Ok(l.local_addr()?.port())
+}
+
+async fn spawn_llama_server(
+    bin: &Path,
+    model: &Path,
+    port: u16,
+) -> anyhow::Result<tokio::process::Child> {
+    tokio::process::Command::new(bin)
+        .args([
+            "--model",
+            model.to_str().context("non-UTF-8 model path")?,
+            "--port",
+            &port.to_string(),
+            "--host",
+            "127.0.0.1",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawn llama-server from {}", bin.display()))
+}
+
+async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if Instant::now() > deadline {
+            return Err(anyhow!("llama-server on port {port} did not become ready within 120s"));
+        }
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                // llama-server returns {"status":"ok"} when ready
+                if text.contains("\"ok\"") {
+                    return Ok(());
+                }
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
+    let mut mgr = state.0.manager.lock().await;
+    if let Some(m) = mgr.running.get(model_ref) {
+        return Ok(m.port);
+    }
+    let gguf = resolve_gguf(&state.0.store_path, &state.0.cache_path, model_ref)
+        .with_context(|| format!("resolve model {model_ref}"))?;
+    let port = find_free_port()?;
+    eprintln!("[llmman] loading {model_ref} on port {port}");
+    let child = spawn_llama_server(&state.0.llama_server_bin, &gguf, port).await?;
+    wait_for_ready(&state.0.client, port).await?;
+    eprintln!("[llmman] {model_ref} ready on port {port}");
+    mgr.running
+        .insert(model_ref.to_string(), RunningModel { _child: child, port });
+    Ok(port)
+}
+
+// ---------------------------------------------------------------------------
+// Proxy helper – forward raw bytes to llama-server and stream back
+// ---------------------------------------------------------------------------
+
+async fn proxy(
+    client: &Client,
+    url: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let mut req = client.post(url).body(body.to_vec());
+    if let Some(ct) = headers.get("content-type") {
+        req = req.header("content-type", ct);
+    }
+    let resp = req.send().await.context("proxy request to llama-server")?;
+    let status = reqwest::StatusCode::from(resp.status());
+    let resp_headers = resp.headers().clone();
+
+    let stream = resp
+        .bytes_stream()
+        .map(|item| item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
+
+    let mut builder = Response::builder().status(status.as_u16());
+    for (k, v) in &resp_headers {
+        builder = builder.header(k, v);
+    }
+    Ok(builder.body(Body::from_stream(stream)).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming conversion: OpenAI SSE → Ollama NDJSON (chat)
+// ---------------------------------------------------------------------------
+
+async fn stream_ollama_chat(
+    client: Client,
+    url: String,
+    oai_req: OAIChatRequest,
+    model: String,
+) -> Result<Response, AppError> {
+    let resp = client
+        .post(&url)
+        .json(&oai_req)
+        .send()
+        .await
+        .context("send to llama-server")?;
+
+    let stream = resp.bytes_stream().map(move |chunk| {
+        let data = chunk.unwrap_or_default();
+        let text = String::from_utf8_lossy(&data);
+        let mut out = String::new();
+        for line in text.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                let fin = OllamaChatChunk {
+                    model: model.clone(),
+                    created_at: now_rfc3339(),
+                    message: OllamaMessage {
+                        role: "assistant".into(),
+                        content: String::new(),
+                    },
+                    done: true,
+                    done_reason: Some("stop".into()),
+                };
+                out.push_str(&serde_json::to_string(&fin).unwrap_or_default());
+                out.push('\n');
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
+                let choice = chunk.choices.first();
+                let content = choice
+                    .and_then(|c| c.delta.content.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                let done = choice
+                    .and_then(|c| c.finish_reason.as_deref())
+                    .map(|r| !r.is_empty() && r != "null")
+                    .unwrap_or(false);
+                let piece = OllamaChatChunk {
+                    model: model.clone(),
+                    created_at: now_rfc3339(),
+                    message: OllamaMessage {
+                        role: "assistant".into(),
+                        content,
+                    },
+                    done,
+                    done_reason: done.then_some("stop".into()),
+                };
+                out.push_str(&serde_json::to_string(&piece).unwrap_or_default());
+                out.push('\n');
+            }
+        }
+        Ok::<_, std::convert::Infallible>(Bytes::from(out))
+    });
+
+    Ok(Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming conversion: OpenAI SSE → Ollama NDJSON (generate)
+// ---------------------------------------------------------------------------
+
+async fn stream_ollama_generate(
+    client: Client,
+    url: String,
+    oai_req: OAIChatRequest,
+    model: String,
+) -> Result<Response, AppError> {
+    let resp = client
+        .post(&url)
+        .json(&oai_req)
+        .send()
+        .await
+        .context("send to llama-server")?;
+
+    let stream = resp.bytes_stream().map(move |chunk| {
+        let data = chunk.unwrap_or_default();
+        let text = String::from_utf8_lossy(&data);
+        let mut out = String::new();
+        for line in text.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                let fin = OllamaGenerateChunk {
+                    model: model.clone(),
+                    created_at: now_rfc3339(),
+                    response: String::new(),
+                    done: true,
+                    done_reason: Some("stop".into()),
+                };
+                out.push_str(&serde_json::to_string(&fin).unwrap_or_default());
+                out.push('\n');
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
+                let choice = chunk.choices.first();
+                let content = choice
+                    .and_then(|c| c.delta.content.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                let done = choice
+                    .and_then(|c| c.finish_reason.as_deref())
+                    .map(|r| !r.is_empty() && r != "null")
+                    .unwrap_or(false);
+                let piece = OllamaGenerateChunk {
+                    model: model.clone(),
+                    created_at: now_rfc3339(),
+                    response: content,
+                    done,
+                    done_reason: done.then_some("stop".into()),
+                };
+                out.push_str(&serde_json::to_string(&piece).unwrap_or_default());
+                out.push('\n');
+            }
+        }
+        Ok::<_, std::convert::Infallible>(Bytes::from(out))
+    });
+
+    Ok(Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming conversion: OpenAI SSE → Anthropic SSE
+// ---------------------------------------------------------------------------
+
+async fn stream_anthropic(
+    client: Client,
+    url: String,
+    oai_req: OAIChatRequest,
+    model: String,
+) -> Result<Response, AppError> {
+    let resp = client
+        .post(&url)
+        .json(&oai_req)
+        .send()
+        .await
+        .context("send to llama-server")?;
+
+    let msg_id = gen_id();
+    let msg_id2 = msg_id.clone();
+    let model2 = model.clone();
+
+    // Emit preamble as first bytes
+    let preamble = {
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            }
+        });
+        let block_start = serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "text", "text": "" }
+        });
+        format!(
+            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n",
+            start, block_start
+        )
+    };
+
+    let stream = futures::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(Bytes::from(preamble))
+    })
+    .chain(resp.bytes_stream().map(move |chunk| {
+        let data = chunk.unwrap_or_default();
+        let text = String::from_utf8_lossy(&data);
+        let mut out = String::new();
+        for line in text.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                let msg_delta = serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                    "usage": { "output_tokens": 0 }
+                });
+                let msg_stop = serde_json::json!({ "type": "message_stop" });
+                out.push_str(&format!(
+                    "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                     event: message_delta\ndata: {msg_delta}\n\n\
+                     event: message_stop\ndata: {msg_stop}\n\n"
+                ));
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
+                let content = chunk
+                    .choices
+                    .first()
+                    .and_then(|c| c.delta.content.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                if !content.is_empty() {
+                    let delta = serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "text_delta", "text": content }
+                    });
+                    out.push_str(&format!("event: content_block_delta\ndata: {delta}\n\n"));
+                }
+            }
+        }
+        Ok::<_, std::convert::Infallible>(Bytes::from(out))
+    }));
+
+    let _ = (msg_id2, model2); // suppress unused warnings
+    Ok(Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_root() -> impl IntoResponse {
+    "llmman is running"
+}
+
+async fn handle_version() -> impl IntoResponse {
+    Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    let store = OciStore::open(&state.0.store_path)?;
+    let list = store.list()?;
+    let models = list
+        .into_iter()
+        .map(|img| OllamaModelInfo {
+            name: img.reference.clone(),
+            model: img.reference,
+            size: img.size,
+            digest: img.digest,
+            modified_at: String::new(),
+            details: OllamaModelDetails {
+                format: "gguf".into(),
+                family: String::new(),
+                parameter_size: String::new(),
+                quantization_level: String::new(),
+            },
+        })
+        .collect();
+    Ok(Json(OllamaTagsResponse { models }))
+}
+
+async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
+    let mgr = state.0.manager.lock().await;
+    let models = mgr
+        .running
+        .keys()
+        .map(|k| OllamaRunningModelInfo {
+            name: k.clone(),
+            model: k.clone(),
+            size: 0,
+            size_vram: 0,
+        })
+        .collect();
+    Json(OllamaPsResponse { models })
+}
+
+async fn handle_show(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaShowRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let model_ref = req.name.as_deref().unwrap_or(&req.model);
+    let store = OciStore::open(&state.0.store_path)?;
+    let desc = store
+        .find(model_ref)
+        .map_err(|_| AppError(anyhow!("model not found: {model_ref}")))?;
+    Ok(Json(OllamaShowResponse {
+        model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
+        details: OllamaModelDetails {
+            format: "gguf".into(),
+            family: String::new(),
+            parameter_size: String::new(),
+            quantization_level: String::new(),
+        },
+    }))
+}
+
+async fn handle_delete(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaDeleteRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let model_ref = req.name.as_deref().unwrap_or(&req.model);
+    let store = OciStore::open(&state.0.store_path)?;
+    store.remove(model_ref)?;
+    Ok(StatusCode::OK)
+}
+
+// -- Ollama /api/chat ---------------------------------------------------------
+
+async fn handle_ollama_chat(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaChatRequest>,
+) -> Result<Response, AppError> {
+    let port = ensure_model(&state, &req.model).await?;
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let oai = OAIChatRequest {
+        model: req.model.clone(),
+        messages: req
+            .messages
+            .iter()
+            .map(|m| OAIMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect(),
+        stream: req.stream,
+        temperature: opt_f64(&req.options, "temperature"),
+        top_p: opt_f64(&req.options, "top_p"),
+        max_tokens: opt_u32(&req.options, "num_predict"),
+    };
+    if req.stream {
+        stream_ollama_chat(state.0.client.clone(), url, oai, req.model).await
+    } else {
+        let resp = state
+            .0
+            .client
+            .post(&url)
+            .json(&oai)
+            .send()
+            .await
+            .context("send to llama-server")?;
+        let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok(Json(OllamaChatChunk {
+            model: req.model,
+            created_at: now_rfc3339(),
+            message: OllamaMessage {
+                role: "assistant".into(),
+                content,
+            },
+            done: true,
+            done_reason: Some("stop".into()),
+        })
+        .into_response())
+    }
+}
+
+// -- Ollama /api/generate -----------------------------------------------------
+
+async fn handle_ollama_generate(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaGenerateRequest>,
+) -> Result<Response, AppError> {
+    let port = ensure_model(&state, &req.model).await?;
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let oai = OAIChatRequest {
+        model: req.model.clone(),
+        messages: vec![OAIMessage {
+            role: "user".into(),
+            content: req.prompt.clone(),
+        }],
+        stream: req.stream,
+        temperature: opt_f64(&req.options, "temperature"),
+        top_p: opt_f64(&req.options, "top_p"),
+        max_tokens: opt_u32(&req.options, "num_predict"),
+    };
+    if req.stream {
+        stream_ollama_generate(state.0.client.clone(), url, oai, req.model).await
+    } else {
+        let resp = state
+            .0
+            .client
+            .post(&url)
+            .json(&oai)
+            .send()
+            .await
+            .context("send to llama-server")?;
+        let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok(Json(OllamaGenerateChunk {
+            model: req.model,
+            created_at: now_rfc3339(),
+            response: content,
+            done: true,
+            done_reason: Some("stop".into()),
+        })
+        .into_response())
+    }
+}
+
+// -- OpenAI pass-through handlers --------------------------------------------
+
+async fn handle_openai_models(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    let store = OciStore::open(&state.0.store_path)?;
+    let list = store.list()?;
+    let data: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|img| {
+            serde_json::json!({
+                "id": img.reference,
+                "object": "model",
+                "created": 0,
+                "owned_by": "llmman",
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "object": "list", "data": data })))
+}
+
+async fn handle_openai_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let req: serde_json::Value =
+        serde_json::from_slice(&body).context("parse OpenAI request body")?;
+    let model = req["model"].as_str().unwrap_or("").to_string();
+    let port = ensure_model(&state, &model).await?;
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    proxy(&state.0.client, &url, &headers, body).await
+}
+
+async fn handle_openai_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let req: serde_json::Value =
+        serde_json::from_slice(&body).context("parse OpenAI request body")?;
+    let model = req["model"].as_str().unwrap_or("").to_string();
+    let port = ensure_model(&state, &model).await?;
+    let url = format!("http://127.0.0.1:{port}/v1/completions");
+    proxy(&state.0.client, &url, &headers, body).await
+}
+
+async fn handle_openai_embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let req: serde_json::Value =
+        serde_json::from_slice(&body).context("parse OpenAI request body")?;
+    let model = req["model"].as_str().unwrap_or("").to_string();
+    let port = ensure_model(&state, &model).await?;
+    let url = format!("http://127.0.0.1:{port}/v1/embeddings");
+    proxy(&state.0.client, &url, &headers, body).await
+}
+
+// -- Anthropic /v1/messages --------------------------------------------------
+
+async fn handle_anthropic_messages(
+    State(state): State<AppState>,
+    Json(req): Json<AnthropicRequest>,
+) -> Result<Response, AppError> {
+    let port = ensure_model(&state, &req.model).await?;
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+
+    let mut messages: Vec<OAIMessage> = Vec::new();
+    if let Some(sys) = &req.system {
+        messages.push(OAIMessage {
+            role: "system".into(),
+            content: sys.clone(),
+        });
+    }
+    for m in &req.messages {
+        messages.push(OAIMessage {
+            role: m.role.clone(),
+            content: m.content.as_text(),
+        });
+    }
+
+    let oai = OAIChatRequest {
+        model: req.model.clone(),
+        messages,
+        stream: req.stream,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        max_tokens: req.max_tokens,
+    };
+
+    if req.stream {
+        stream_anthropic(state.0.client.clone(), url, oai, req.model).await
+    } else {
+        let resp = state
+            .0
+            .client
+            .post(&url)
+            .json(&oai)
+            .send()
+            .await
+            .context("send to llama-server")?;
+        let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok(Json(serde_json::json!({
+            "id": format!("msg_{}", gen_id()),
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": content }],
+            "model": req.model,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 0, "output_tokens": 0 }
+        }))
+        .into_response())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Option extractors from Ollama options blob
+// ---------------------------------------------------------------------------
+
+fn opt_f64(opts: &Option<serde_json::Value>, key: &str) -> Option<f32> {
+    opts.as_ref()?.get(key)?.as_f64().map(|f| f as f32)
+}
+
+fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
+    opts.as_ref()?.get(key)?.as_u64().map(|n| n as u32)
+}
+
+// ---------------------------------------------------------------------------
+// llama-server binary resolution
+// ---------------------------------------------------------------------------
+
+fn resolve_llama_server() -> anyhow::Result<PathBuf> {
+    // Common well-known locations
+    let candidates = [
+        "/usr/local/bin/llama-server",
+        "/usr/bin/llama-server",
+        "/opt/homebrew/bin/llama-server",
+    ];
+    for c in &candidates {
+        if Path::new(c).exists() {
+            return Ok(PathBuf::from(c));
+        }
+    }
+    // Search PATH via `which`
+    if let Ok(out) = std::process::Command::new("which")
+        .arg("llama-server")
+        .output()
+    {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() {
+                return Ok(PathBuf::from(p));
+            }
+        }
+    }
+    Err(anyhow!(
+        "llama-server not found; install llama.cpp and ensure it is on PATH"
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
+    tokio::runtime::Runtime::new()?.block_on(serve_async(args))
+}
+
+async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
+    let llama_server_bin = resolve_llama_server()?;
+    let store_path = default_store(None)?;
+    let cache_path = store_path
+        .parent()
+        .unwrap_or(&store_path)
+        .join("cache");
+    std::fs::create_dir_all(&cache_path)?;
+
+    let state = AppState(Arc::new(Inner {
+        manager: Mutex::new(ModelManager {
+            running: HashMap::new(),
+        }),
+        llama_server_bin,
+        store_path,
+        cache_path,
+        client: Client::new(),
+    }));
+
+    let app = Router::new()
+        // Health
+        .route("/", get(handle_root))
+        // Ollama API
+        .route("/api/version", get(handle_version))
+        .route("/api/tags", get(handle_tags))
+        .route("/api/ps", get(handle_ps))
+        .route("/api/show", post(handle_show))
+        .route("/api/delete", delete(handle_delete))
+        .route("/api/chat", post(handle_ollama_chat))
+        .route("/api/generate", post(handle_ollama_generate))
+        // OpenAI API
+        .route("/v1/models", get(handle_openai_models))
+        .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/completions", post(handle_openai_completions))
+        .route("/v1/embeddings", post(handle_openai_embeddings))
+        // Anthropic API
+        .route("/v1/messages", post(handle_anthropic_messages))
+        .with_state(state);
+
+    let addr = "0.0.0.0:11434";
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
+    eprintln!("llmman serve listening on {addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}

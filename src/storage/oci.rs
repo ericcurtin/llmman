@@ -81,6 +81,7 @@ pub struct ImageSummary {
     #[allow(dead_code)]
     pub media_type: String,
     pub size: u64,
+    pub modified_at: Option<std::time::SystemTime>,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,11 +282,17 @@ impl OciStore {
                     .and_then(|a| a.get("org.opencontainers.image.ref.name"))
                     .cloned()
                     .unwrap_or_else(|| m.digest.clone());
+                let modified_at = self
+                    .blob_path(&m.digest)
+                    .ok()
+                    .and_then(|p| fs::metadata(p).ok())
+                    .and_then(|meta| meta.modified().ok());
                 ImageSummary {
                     reference,
                     digest: m.digest,
                     media_type: m.media_type,
                     size: m.size,
+                    modified_at,
                 }
             })
             .collect())

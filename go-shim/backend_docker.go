@@ -581,16 +581,15 @@ func updateIndex(layoutDir, ref string, manifestDesc ocispec.Descriptor) error {
 			MediaType: ocispec.MediaTypeImageIndex,
 		}
 	}
-	tag := tagFromRef(ref)
 	if manifestDesc.Annotations == nil {
 		manifestDesc.Annotations = map[string]string{}
 	}
-	manifestDesc.Annotations[ocispec.AnnotationRefName] = tag
+	manifestDesc.Annotations[ocispec.AnnotationRefName] = ref
 
 	// Replace existing entry with same ref name, or append
 	replaced := false
 	for i, m := range idx.Manifests {
-		if m.Annotations != nil && m.Annotations[ocispec.AnnotationRefName] == tag {
+		if m.Annotations != nil && m.Annotations[ocispec.AnnotationRefName] == ref {
 			idx.Manifests[i] = manifestDesc
 			replaced = true
 			break

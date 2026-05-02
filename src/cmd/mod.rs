@@ -6,4 +6,5 @@ pub mod logout;
 pub mod pull;
 pub mod push;
 pub mod rm;
+pub mod serve;
 pub mod tag;

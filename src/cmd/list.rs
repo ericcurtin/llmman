@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::time::SystemTime;
 
 use clap::Args;
 
@@ -11,63 +11,77 @@ pub struct ListArgs {
     pub store: Option<PathBuf>,
 }
 
+use std::path::PathBuf;
+
 pub fn run(args: &ListArgs) -> anyhow::Result<()> {
     let store_root = crate::default_store(args.store.as_deref())?;
     let store = OciStore::open(&store_root)?;
     let images = store.list()?;
 
     if images.is_empty() {
-        println!("(no images)");
         return Ok(());
     }
 
-    // Column widths
-    let ref_w = images.iter().map(|i| i.reference.len()).max().unwrap_or(9).max(9);
-    let dig_w = 19; // "sha256:<12 chars>…"
+    let name_w = images.iter().map(|i| i.reference.len()).max().unwrap_or(4).max(4);
 
     println!(
-        "{:<ref_w$}  {:<dig_w$}  SIZE",
-        "REFERENCE",
-        "DIGEST",
-        ref_w = ref_w,
-        dig_w = dig_w,
+        "{:<name_w$}    {:<16}    {:<10}    {}",
+        "NAME", "ID", "SIZE", "MODIFIED",
+        name_w = name_w,
     );
-    println!("{}", "-".repeat(ref_w + dig_w + 12));
 
     for img in &images {
-        let short_digest = short_digest(&img.digest);
-        let size_str = human_size(img.size);
         println!(
-            "{:<ref_w$}  {:<dig_w$}  {}",
+            "{:<name_w$}    {:<16}    {:<10}    {}",
             img.reference,
-            short_digest,
-            size_str,
-            ref_w = ref_w,
-            dig_w = dig_w,
+            short_id(&img.digest),
+            human_size(img.size),
+            relative_time(img.modified_at),
+            name_w = name_w,
         );
     }
     Ok(())
 }
 
-fn short_digest(digest: &str) -> String {
-    if let Some(hex) = digest.strip_prefix("sha256:") {
-        format!("sha256:{}", &hex[..hex.len().min(12)])
-    } else {
-        digest.chars().take(19).collect()
-    }
+fn short_id(digest: &str) -> String {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    hex.chars().take(12).collect()
 }
 
 fn human_size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    const KB: u64 = 1_000;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} kB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn relative_time(t: Option<SystemTime>) -> String {
+    let secs = match t {
+        Some(t) => SystemTime::now()
+            .duration_since(t)
+            .unwrap_or_default()
+            .as_secs(),
+        None => return "unknown".into(),
+    };
+    match secs {
+        s if s < 60          => "just now".into(),
+        s if s < 3600        => format!("{} minutes ago", s / 60),
+        s if s < 86400       => format!("{} hours ago", s / 3600),
+        s if s < 86400 * 2   => "yesterday".into(),
+        s if s < 86400 * 7   => format!("{} days ago", s / 86400),
+        s if s < 86400 * 14  => "1 week ago".into(),
+        s if s < 86400 * 30  => format!("{} weeks ago", s / (86400 * 7)),
+        s if s < 86400 * 60  => "1 month ago".into(),
+        s if s < 86400 * 365 => format!("{} months ago", s / (86400 * 30)),
+        s if s < 86400 * 730 => "1 year ago".into(),
+        s                    => format!("{} years ago", s / (86400 * 365)),
     }
 }
