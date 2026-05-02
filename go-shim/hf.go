@@ -221,11 +221,60 @@ func parseHFRef(ref string) (host, owner, repo, tag string, err error) {
 // pullHF — top-level HuggingFace pull
 // ---------------------------------------------------------------------------
 
+// cachedLayerName returns the GGUF filename for ref if it is fully cached in
+// the local OCI store (manifest blob + all layer blobs present), or "" if not.
+func cachedLayerName(layoutDir, ref string) string {
+	idx, err := readIndex(layoutDir)
+	if err != nil {
+		return ""
+	}
+	for _, m := range idx.Manifests {
+		if m.Annotations[ocispec.AnnotationRefName] != ref {
+			continue
+		}
+		if !blobExists(layoutDir, m) {
+			return ""
+		}
+		data, err := readBlob(layoutDir, m.Digest)
+		if err != nil {
+			return ""
+		}
+		var manifest ocispec.Manifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return ""
+		}
+		for _, layer := range manifest.Layers {
+			if !blobExists(layoutDir, layer) {
+				return ""
+			}
+		}
+		// All blobs present — return the GGUF filename from the layer annotation.
+		if len(manifest.Layers) > 0 {
+			if name := manifest.Layers[0].Annotations[ocispec.AnnotationTitle]; name != "" {
+				return name
+			}
+		}
+		return ref
+	}
+	return ""
+}
+
 func pullHF(ctx context.Context, ref, layoutDir string) error {
 	host, owner, repo, tag, err := parseHFRef(ref)
 	if err != nil {
 		return err
 	}
+
+	if err := ensureLayout(layoutDir); err != nil {
+		return fmt.Errorf("init OCI layout: %w", err)
+	}
+
+	// Fast path: skip all network I/O if the ref is fully cached locally.
+	if name := cachedLayerName(layoutDir, ref); name != "" {
+		fmt.Fprintf(os.Stderr, "Cached   %s\n", name)
+		return nil
+	}
+
 	endpoint := hfEndpoint(host)
 	token := os.Getenv("HF_TOKEN")
 	client := &http.Client{Timeout: 120 * time.Second}
@@ -245,10 +294,6 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 		return err
 	}
 
-	if err := ensureLayout(layoutDir); err != nil {
-		return fmt.Errorf("init OCI layout: %w", err)
-	}
-
 	downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + chosen.Path
 	ggufDesc, err := downloadHFBlob(ctx, client, downloadURL, token, layoutDir, owner, repo, commit, chosen)
 	if err != nil {
@@ -265,24 +310,6 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layoutDir, owner, repo, commit string, file hfFile) (ocispec.Descriptor, error) {
 	if err := os.MkdirAll(filepath.Join(layoutDir, "blobs"), 0o755); err != nil {
 		return ocispec.Descriptor{}, err
-	}
-
-	// Fast path: HuggingFace OIDs are the SHA-256 of the raw file content,
-	// which is exactly our content-addressed blob store key.  If the blob is
-	// already present with the right size, skip the download entirely.
-	if len(file.OID) == 64 {
-		dest := filepath.Join(layoutDir, "blobs", "sha256", file.OID)
-		if fi, err := os.Stat(dest); err == nil && fi.Size() == file.Size {
-			fmt.Fprintf(os.Stderr, "Cached   %s\n", filepath.Base(file.Path))
-			return ocispec.Descriptor{
-				MediaType: hfGGUFMediaType,
-				Digest:    digest.Digest("sha256:" + file.OID),
-				Size:      file.Size,
-				Annotations: map[string]string{
-					ocispec.AnnotationTitle: filepath.Base(file.Path),
-				},
-			}, nil
-		}
 	}
 
 	// Deterministic temp path keyed by (owner, repo, commit prefix, filename)
