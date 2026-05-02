@@ -1,9 +1,9 @@
 # llmman
 
 A command-line tool for managing LLM model images in OCI registries.
-Models are packaged as standard OCI artifacts and stored in any compatible registry (Docker Hub, GHCR, ECR, self-hosted, etc.).
+Models are packaged as standard OCI artifacts and stored in any compatible registry (Docker Hub, GHCR, quay, self-hosted, etc.).
 
-`llmman` is written in Rust and uses the same registry transport libraries as Docker or Podman — selected at compile time — without spawning either as a subprocess.
+`llmman` is written in Rust and uses the same registry transport libraries as Docker or Podman selected at compile time without spawning either as a subprocess.
 
 ## Commands
 
@@ -34,20 +34,6 @@ Download the latest binary for your platform from the [releases page](../../rele
 | Windows aarch64 | `llmman-aarch64-pc-windows-msvc.exe` |
 
 ### Build from source
-
-**Prerequisites**
-
-- Rust 1.75+ (`rustup` recommended)
-- Go 1.22+
-- A C compiler (gcc on Linux, Xcode CLT on macOS, MSVC on Windows)
-
-```
-cargo build --release
-```
-
-The build script (`build.rs`) compiles the Go transport shim and links it into the binary automatically.
-
-## Usage
 
 ### Build a model image
 
