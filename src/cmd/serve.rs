@@ -857,6 +857,8 @@ async fn handle_ollama_chat(
     eprintln!("[llmman] /api/chat model={:?} messages={}", req.model, req.messages.len());
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    // Always use non-streaming to llama-server — matches ollama's collect-then-deliver
+    // model and avoids all SSE parsing fragmentation issues.
     let oai = OAIChatRequest {
         model: req.model.clone(),
         messages: req
@@ -867,39 +869,40 @@ async fn handle_ollama_chat(
                 content: m.content.clone(),
             })
             .collect(),
-        stream: req.stream,
+        stream: false,
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    if req.stream {
-        stream_ollama_chat(state.0.client.clone(), url, oai, req.model).await
-    } else {
-        let resp = state
-            .0
-            .client
-            .post(&url)
-            .json(&oai)
-            .send()
-            .await
-            .context("send to llama-server")?;
-        let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
-        let content = body["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        Ok(Json(OllamaChatChunk {
-            model: req.model,
-            created_at: now_rfc3339(),
-            message: OllamaMessage {
-                role: "assistant".into(),
-                content,
-            },
-            done: true,
-            done_reason: Some("stop".into()),
-        })
-        .into_response())
+    let resp = state
+        .0
+        .client
+        .post(&url)
+        .json(&oai)
+        .send()
+        .await
+        .context("send to llama-server")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError(anyhow!("llama-server {status}: {body}")));
     }
+    let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    Ok(Json(OllamaChatChunk {
+        model: req.model,
+        created_at: now_rfc3339(),
+        message: OllamaMessage {
+            role: "assistant".into(),
+            content,
+        },
+        done: true,
+        done_reason: Some("stop".into()),
+    })
+    .into_response())
 }
 
 // -- Ollama /api/generate -----------------------------------------------------
@@ -911,42 +914,45 @@ async fn handle_ollama_generate(
     eprintln!("[llmman] /api/generate model={:?} prompt_len={}", req.model, req.prompt.len());
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    // Always use non-streaming to llama-server — matches ollama's collect-then-deliver
+    // model and avoids all SSE parsing fragmentation issues.
     let oai = OAIChatRequest {
         model: req.model.clone(),
         messages: vec![OAIMessage {
             role: "user".into(),
             content: req.prompt.clone(),
         }],
-        stream: req.stream,
+        stream: false,
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    if req.stream {
-        stream_ollama_generate(state.0.client.clone(), url, oai, req.model).await
-    } else {
-        let resp = state
-            .0
-            .client
-            .post(&url)
-            .json(&oai)
-            .send()
-            .await
-            .context("send to llama-server")?;
-        let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
-        let content = body["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        Ok(Json(OllamaGenerateChunk {
-            model: req.model,
-            created_at: now_rfc3339(),
-            response: content,
-            done: true,
-            done_reason: Some("stop".into()),
-        })
-        .into_response())
+    let resp = state
+        .0
+        .client
+        .post(&url)
+        .json(&oai)
+        .send()
+        .await
+        .context("send to llama-server")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError(anyhow!("llama-server {status}: {body}")));
     }
+    let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    Ok(Json(OllamaGenerateChunk {
+        model: req.model,
+        created_at: now_rfc3339(),
+        response: content,
+        done: true,
+        done_reason: Some("stop".into()),
+    })
+    .into_response())
 }
 
 // -- OpenAI pass-through handlers --------------------------------------------
