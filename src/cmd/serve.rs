@@ -483,6 +483,53 @@ async fn proxy(
 }
 
 // ---------------------------------------------------------------------------
+// collect_completion — like ollama's Completion() but in Rust.
+//
+// Sends a streaming request to llama-server's /v1/chat/completions
+// (stream:true, same as ollama always uses), collects every byte until EOF,
+// then parses all SSE lines in one pass.  This avoids both the non-streaming
+// timeout problem (server must generate everything before sending a byte) and
+// the async-streaming fragmentation problem (partial SSE lines across chunks).
+// ---------------------------------------------------------------------------
+
+async fn collect_completion(
+    client: &Client,
+    url: &str,
+    oai: OAIChatRequest,
+) -> Result<String, AppError> {
+    let resp = client
+        .post(url)
+        .json(&oai)
+        .send()
+        .await
+        .context("send to llama-server")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+    }
+    let raw = resp.bytes().await.context("read llama-server response")?;
+    let text = String::from_utf8_lossy(&raw);
+    eprintln!("[llmman] llama-server raw ({} bytes)", raw.len());
+
+    let mut content = String::new();
+    for line in text.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            break;
+        }
+        if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
+            if let Some(tok) = chunk.choices.first().and_then(|c| c.delta.content.as_deref()) {
+                content.push_str(tok);
+            }
+        }
+    }
+    Ok(content)
+}
+
+// ---------------------------------------------------------------------------
 // SSE line buffering
 //
 // reqwest::bytes_stream() delivers raw TCP chunks; a single `data: {json}\n`
@@ -857,8 +904,6 @@ async fn handle_ollama_chat(
     eprintln!("[llmman] /api/chat model={:?} messages={}", req.model, req.messages.len());
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    // Always use non-streaming to llama-server — matches ollama's collect-then-deliver
-    // model and avoids all SSE parsing fragmentation issues.
     let oai = OAIChatRequest {
         model: req.model.clone(),
         messages: req
@@ -869,29 +914,12 @@ async fn handle_ollama_chat(
                 content: m.content.clone(),
             })
             .collect(),
-        stream: false,
+        stream: true,
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    let resp = state
-        .0
-        .client
-        .post(&url)
-        .json(&oai)
-        .send()
-        .await
-        .context("send to llama-server")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("llama-server {status}: {body}")));
-    }
-    let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let content = collect_completion(&state.0.client, &url, oai).await?;
     Ok(Json(OllamaChatChunk {
         model: req.model,
         created_at: now_rfc3339(),
@@ -914,37 +942,18 @@ async fn handle_ollama_generate(
     eprintln!("[llmman] /api/generate model={:?} prompt_len={}", req.model, req.prompt.len());
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    // Always use non-streaming to llama-server — matches ollama's collect-then-deliver
-    // model and avoids all SSE parsing fragmentation issues.
     let oai = OAIChatRequest {
         model: req.model.clone(),
         messages: vec![OAIMessage {
             role: "user".into(),
             content: req.prompt.clone(),
         }],
-        stream: false,
+        stream: true,
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    let resp = state
-        .0
-        .client
-        .post(&url)
-        .json(&oai)
-        .send()
-        .await
-        .context("send to llama-server")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("llama-server {status}: {body}")));
-    }
-    let body: serde_json::Value = resp.json().await.context("parse llama-server response")?;
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let content = collect_completion(&state.0.client, &url, oai).await?;
     Ok(Json(OllamaGenerateChunk {
         model: req.model,
         created_at: now_rfc3339(),
