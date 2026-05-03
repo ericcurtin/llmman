@@ -409,6 +409,8 @@ async fn spawn_llama_server(
             &port.to_string(),
             "--host",
             "127.0.0.1",
+            "--n-gpu-layers",
+            "999",  // use all available GPU layers (Metal/CUDA); falls back to CPU safely
         ])
         .kill_on_drop(true)
         .spawn()
@@ -493,10 +495,16 @@ async fn proxy(
 // ---------------------------------------------------------------------------
 
 async fn collect_completion(
-    client: &Client,
+    _shared_client: &Client,
     url: &str,
     oai: OAIChatRequest,
 ) -> Result<String, AppError> {
+    // Use a fresh client per request.  The shared client's connection pool is
+    // polluted by the many health-check GETs in wait_for_ready; reusing those
+    // connections for the completion POST can silently produce an empty body
+    // when llama-server has already closed the idle connection on its end.
+    let client = reqwest::Client::new();
+
     let resp = client
         .post(url)
         .json(&oai)
@@ -509,9 +517,12 @@ async fn collect_completion(
         return Err(AppError(anyhow!("llama-server {status}: {body}")));
     }
     let raw = resp.bytes().await.context("read llama-server response")?;
-    let text = String::from_utf8_lossy(&raw);
-    eprintln!("[llmman] llama-server raw ({} bytes)", raw.len());
+    eprintln!("[llmman] llama-server raw {} bytes", raw.len());
+    if raw.is_empty() {
+        return Err(AppError(anyhow!("llama-server returned empty response body")));
+    }
 
+    let text = String::from_utf8_lossy(&raw);
     let mut content = String::new();
     for line in text.lines() {
         let Some(payload) = line.strip_prefix("data: ") else {
@@ -525,6 +536,12 @@ async fn collect_completion(
                 content.push_str(tok);
             }
         }
+    }
+
+    if content.is_empty() {
+        // Log the raw response for diagnosis so the user can see what came back
+        let preview: String = text.chars().take(400).collect();
+        eprintln!("[llmman] WARNING: empty content extracted. Raw preview:\n{preview}");
     }
     Ok(content)
 }
