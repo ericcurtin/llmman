@@ -483,6 +483,61 @@ async fn proxy(
 }
 
 // ---------------------------------------------------------------------------
+// SSE line buffering
+//
+// reqwest::bytes_stream() delivers raw TCP chunks; a single `data: {json}\n`
+// SSE line can be split across two chunks.  bytes_to_lines buffers incomplete
+// data and only yields complete newline-terminated lines, so downstream JSON
+// parsing never sees a partial line.
+// ---------------------------------------------------------------------------
+
+fn bytes_to_lines(
+    stream: impl futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+) -> impl futures::Stream<Item = String> + Send + 'static {
+    futures::stream::unfold(
+        (stream.boxed(), String::new()),
+        |(mut stream, mut buf)| async move {
+            loop {
+                if let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                    buf.drain(..=pos);
+                    return Some((line, (stream, buf)));
+                }
+                match futures::StreamExt::next(&mut stream).await {
+                    Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+                    Some(Err(_)) | None => {
+                        if buf.is_empty() {
+                            return None;
+                        }
+                        let line = std::mem::take(&mut buf);
+                        return Some((line, (stream, buf)));
+                    }
+                }
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Shared SSE-chunk helper
+// ---------------------------------------------------------------------------
+
+fn oai_chunk_to_content(payload: &str) -> Option<(String, bool)> {
+    if payload == "[DONE]" {
+        return Some((String::new(), true));
+    }
+    let chunk = serde_json::from_str::<OAIChunk>(payload).ok()?;
+    let choice = chunk.choices.first()?;
+    let content = choice.delta.content.as_deref().unwrap_or("").to_string();
+    let done = choice
+        .finish_reason
+        .as_deref()
+        .map(|r| !r.is_empty() && r != "null")
+        .unwrap_or(false);
+    Some((content, done))
+}
+
+// ---------------------------------------------------------------------------
 // Streaming conversion: OpenAI SSE → Ollama NDJSON (chat)
 // ---------------------------------------------------------------------------
 
@@ -504,53 +559,20 @@ async fn stream_ollama_chat(
         return Err(AppError(anyhow!("llama-server {status}: {body}")));
     }
 
-    let stream = resp.bytes_stream().map(move |chunk| {
-        let data = chunk.unwrap_or_default();
-        let text = String::from_utf8_lossy(&data);
-        let mut out = String::new();
-        for line in text.lines() {
-            let Some(payload) = line.strip_prefix("data: ") else {
-                continue;
-            };
-            if payload == "[DONE]" {
-                let fin = OllamaChatChunk {
+    let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+        let out = line.strip_prefix("data: ")
+            .and_then(|p| oai_chunk_to_content(p))
+            .map(|(content, done)| {
+                let chunk = OllamaChatChunk {
                     model: model.clone(),
                     created_at: now_rfc3339(),
-                    message: OllamaMessage {
-                        role: "assistant".into(),
-                        content: String::new(),
-                    },
-                    done: true,
-                    done_reason: Some("stop".into()),
-                };
-                out.push_str(&serde_json::to_string(&fin).unwrap_or_default());
-                out.push('\n');
-                continue;
-            }
-            if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
-                let choice = chunk.choices.first();
-                let content = choice
-                    .and_then(|c| c.delta.content.as_deref())
-                    .unwrap_or("")
-                    .to_string();
-                let done = choice
-                    .and_then(|c| c.finish_reason.as_deref())
-                    .map(|r| !r.is_empty() && r != "null")
-                    .unwrap_or(false);
-                let piece = OllamaChatChunk {
-                    model: model.clone(),
-                    created_at: now_rfc3339(),
-                    message: OllamaMessage {
-                        role: "assistant".into(),
-                        content,
-                    },
+                    message: OllamaMessage { role: "assistant".into(), content },
                     done,
                     done_reason: done.then_some("stop".into()),
                 };
-                out.push_str(&serde_json::to_string(&piece).unwrap_or_default());
-                out.push('\n');
-            }
-        }
+                serde_json::to_string(&chunk).unwrap_or_default() + "\n"
+            })
+            .unwrap_or_default();
         Ok::<_, std::convert::Infallible>(Bytes::from(out))
     });
 
@@ -582,47 +604,20 @@ async fn stream_ollama_generate(
         return Err(AppError(anyhow!("llama-server {status}: {body}")));
     }
 
-    let stream = resp.bytes_stream().map(move |chunk| {
-        let data = chunk.unwrap_or_default();
-        let text = String::from_utf8_lossy(&data);
-        let mut out = String::new();
-        for line in text.lines() {
-            let Some(payload) = line.strip_prefix("data: ") else {
-                continue;
-            };
-            if payload == "[DONE]" {
-                let fin = OllamaGenerateChunk {
+    let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+        let out = line.strip_prefix("data: ")
+            .and_then(|p| oai_chunk_to_content(p))
+            .map(|(response, done)| {
+                let chunk = OllamaGenerateChunk {
                     model: model.clone(),
                     created_at: now_rfc3339(),
-                    response: String::new(),
-                    done: true,
-                    done_reason: Some("stop".into()),
-                };
-                out.push_str(&serde_json::to_string(&fin).unwrap_or_default());
-                out.push('\n');
-                continue;
-            }
-            if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
-                let choice = chunk.choices.first();
-                let content = choice
-                    .and_then(|c| c.delta.content.as_deref())
-                    .unwrap_or("")
-                    .to_string();
-                let done = choice
-                    .and_then(|c| c.finish_reason.as_deref())
-                    .map(|r| !r.is_empty() && r != "null")
-                    .unwrap_or(false);
-                let piece = OllamaGenerateChunk {
-                    model: model.clone(),
-                    created_at: now_rfc3339(),
-                    response: content,
+                    response,
                     done,
                     done_reason: done.then_some("stop".into()),
                 };
-                out.push_str(&serde_json::to_string(&piece).unwrap_or_default());
-                out.push('\n');
-            }
-        }
+                serde_json::to_string(&chunk).unwrap_or_default() + "\n"
+            })
+            .unwrap_or_default();
         Ok::<_, std::convert::Infallible>(Bytes::from(out))
     });
 
@@ -655,10 +650,6 @@ async fn stream_anthropic(
     }
 
     let msg_id = gen_id();
-    let msg_id2 = msg_id.clone();
-    let model2 = model.clone();
-
-    // Emit preamble as first bytes
     let preamble = {
         let start = serde_json::json!({
             "type": "message_start",
@@ -678,22 +669,16 @@ async fn stream_anthropic(
             "content_block": { "type": "text", "text": "" }
         });
         format!(
-            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n",
-            start, block_start
+            "event: message_start\ndata: {start}\n\nevent: content_block_start\ndata: {block_start}\n\n"
         )
     };
 
-    let stream = futures::stream::once(async move {
-        Ok::<_, std::convert::Infallible>(Bytes::from(preamble))
-    })
-    .chain(resp.bytes_stream().map(move |chunk| {
-        let data = chunk.unwrap_or_default();
-        let text = String::from_utf8_lossy(&data);
-        let mut out = String::new();
-        for line in text.lines() {
-            let Some(payload) = line.strip_prefix("data: ") else {
-                continue;
-            };
+    let preamble_stream = futures::stream::once(futures::future::ready(
+        Ok::<_, std::convert::Infallible>(Bytes::from(preamble)),
+    ));
+
+    let sse_stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+        let out = if let Some(payload) = line.strip_prefix("data: ") {
             if payload == "[DONE]" {
                 let msg_delta = serde_json::json!({
                     "type": "message_delta",
@@ -701,38 +686,39 @@ async fn stream_anthropic(
                     "usage": { "output_tokens": 0 }
                 });
                 let msg_stop = serde_json::json!({ "type": "message_stop" });
-                out.push_str(&format!(
+                format!(
                     "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
                      event: message_delta\ndata: {msg_delta}\n\n\
                      event: message_stop\ndata: {msg_stop}\n\n"
-                ));
-                continue;
-            }
-            if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
-                let content = chunk
-                    .choices
-                    .first()
+                )
+            } else if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
+                let content = chunk.choices.first()
                     .and_then(|c| c.delta.content.as_deref())
                     .unwrap_or("")
                     .to_string();
-                if !content.is_empty() {
+                if content.is_empty() {
+                    String::new()
+                } else {
                     let delta = serde_json::json!({
                         "type": "content_block_delta",
                         "index": 0,
                         "delta": { "type": "text_delta", "text": content }
                     });
-                    out.push_str(&format!("event: content_block_delta\ndata: {delta}\n\n"));
+                    format!("event: content_block_delta\ndata: {delta}\n\n")
                 }
+            } else {
+                String::new()
             }
-        }
+        } else {
+            String::new()
+        };
         Ok::<_, std::convert::Infallible>(Bytes::from(out))
-    }));
+    });
 
-    let _ = (msg_id2, model2); // suppress unused warnings
     Ok(Response::builder()
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(preamble_stream.chain(sse_stream)))
         .unwrap())
 }
 
