@@ -2,9 +2,7 @@
 
 A command-line tool for managing and serving LLM models using OCI registries.
 Models are packaged as standard OCI artifacts and stored in any compatible registry (Docker Hub, GHCR, quay, self-hosted, etc.).
-`llmman serve` exposes Ollama-, OpenAI-, and Anthropic-compatible HTTP APIs backed by `llama-server` subprocesses.
-
-`llmman` is written in Rust and uses the same registry transport libraries as Docker or Podman selected at compile time without spawning either as a subprocess.
+`llmman serve` exposes Ollama-, OpenAI-, and Anthropic-compatible HTTP APIs.
 
 ## Commands
 
@@ -25,27 +23,8 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 
 ### Pull a model
 
-Pull directly from HuggingFace using short names:
-
-```
-llmman pull qwen3.5:0.8b-q4_K_M
-```
-
-Or use the full reference:
-
 ```
 llmman pull unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
-```
-
-### List local models
-
-```
-llmman ls
-```
-
-```
-NAME                                      ID              SIZE      MODIFIED
-unsloth/Qwen3.5-0.8B-GGUF:latest    b55c07040368    532.5 MB  2 hours ago
 ```
 
 ### Serve
@@ -100,46 +79,6 @@ llmman pull granite4.1:8b-q4_K_M  # → unsloth/granite-4.1-8b-GGUF:Q4_K_M
 ```
 
 Short names work with all commands: `pull`, `push`, `rm`, `tag`, `inspect`, and `serve`.
-
-## Registry operations
-
-### Authenticate
-
-```
-llmman login registry.example.com -u alice
-# prompts for password
-
-llmman logout registry.example.com
-```
-
-Credentials are stored in the Docker credential store (`~/.docker/config.json`), shared with `docker` and `podman`.
-
-### Push and pull (OCI registries)
-
-```
-llmman push registry.example.com/mymodel:v1
-
-llmman pull registry.example.com/mymodel:v1
-```
-
-### Build a model image
-
-Package every file in a directory as a set of OCI layers:
-
-```
-llmman build -t registry.example.com/mymodel:v1 ./path/to/model/
-```
-
-### Tag, remove, inspect
-
-```
-llmman tag registry.example.com/mymodel:v1 registry.example.com/mymodel:latest
-
-llmman rm registry.example.com/mymodel:v1
-
-llmman inspect registry.example.com/mymodel:v1
-llmman inspect --remote registry.example.com/mymodel:v1
-```
 
 ## Store location
 
