@@ -62,6 +62,8 @@ struct RunningModel {
 struct OllamaMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +101,8 @@ struct OllamaGenerateChunk {
     model: String,
     created_at: String,
     response: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
     done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     done_reason: Option<String>,
@@ -245,6 +249,8 @@ struct OAIChunkChoice {
 #[derive(Debug, Deserialize)]
 struct OAIChunkDelta {
     content: Option<String>,
+    /// llama-server sends reasoning/thinking content here when --reasoning is enabled
+    thinking: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -409,9 +415,9 @@ async fn spawn_llama_server(
             &port.to_string(),
             "--host",
             "127.0.0.1",
-            "--reasoning",    "off",  // disable thinking/reasoning mode globally; thinking models
-                                      // otherwise fill the entire context with reasoning tokens
-                                      // and produce empty visible responses
+            // Cap thinking tokens so reasoning models don't exhaust the context.
+            // Thinking is still shown to users via message.thinking / response.thinking.
+            "--reasoning-budget", "2048",
         ])
         .kill_on_drop(true)
         .spawn()
@@ -529,13 +535,10 @@ async fn collect_completion(
         let Some(payload) = line.strip_prefix("data: ") else {
             continue;
         };
-        if payload == "[DONE]" {
-            break;
-        }
-        if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
-            if let Some(tok) = chunk.choices.first().and_then(|c| c.delta.content.as_deref()) {
-                content.push_str(tok);
-            }
+        match oai_chunk_to_content(payload) {
+            Some((tok, _thinking, true)) => { content.push_str(&tok); break; }
+            Some((tok, _thinking, false)) => content.push_str(&tok),
+            None => {}
         }
     }
 
@@ -587,19 +590,21 @@ fn bytes_to_lines(
 // Shared SSE-chunk helper
 // ---------------------------------------------------------------------------
 
-fn oai_chunk_to_content(payload: &str) -> Option<(String, bool)> {
+/// Returns (content, thinking, done).
+fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)> {
     if payload == "[DONE]" {
-        return Some((String::new(), true));
+        return Some((String::new(), None, true));
     }
     let chunk = serde_json::from_str::<OAIChunk>(payload).ok()?;
     let choice = chunk.choices.first()?;
     let content = choice.delta.content.as_deref().unwrap_or("").to_string();
+    let thinking = choice.delta.thinking.clone().filter(|s| !s.is_empty());
     let done = choice
         .finish_reason
         .as_deref()
         .map(|r| !r.is_empty() && r != "null")
         .unwrap_or(false);
-    Some((content, done))
+    Some((content, thinking, done))
 }
 
 // ---------------------------------------------------------------------------
@@ -627,11 +632,11 @@ async fn stream_ollama_chat(
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
         let out = line.strip_prefix("data: ")
             .and_then(|p| oai_chunk_to_content(p))
-            .map(|(content, done)| {
+            .map(|(content, thinking, done)| {
                 let chunk = OllamaChatChunk {
                     model: model.clone(),
                     created_at: now_rfc3339(),
-                    message: OllamaMessage { role: "assistant".into(), content },
+                    message: OllamaMessage { role: "assistant".into(), content, thinking },
                     done,
                     done_reason: done.then_some("stop".into()),
                 };
@@ -672,11 +677,12 @@ async fn stream_ollama_generate(
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
         let out = line.strip_prefix("data: ")
             .and_then(|p| oai_chunk_to_content(p))
-            .map(|(response, done)| {
+            .map(|(response, thinking, done)| {
                 let chunk = OllamaGenerateChunk {
                     model: model.clone(),
                     created_at: now_rfc3339(),
                     response,
+                    thinking,
                     done,
                     done_reason: done.then_some("stop".into()),
                 };
