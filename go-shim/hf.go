@@ -248,10 +248,13 @@ func cachedLayerName(layoutDir, ref string) string {
 				return ""
 			}
 		}
-		// All blobs present — return the GGUF filename from the layer annotation.
+		// All blobs present — return a filename from the first layer annotation.
 		if len(manifest.Layers) > 0 {
-			if name := manifest.Layers[0].Annotations[ocispec.AnnotationTitle]; name != "" {
-				return name
+			ann := manifest.Layers[0].Annotations
+			for _, key := range []string{"org.cncf.model.filepath", ocispec.AnnotationTitle} {
+				if name := ann[key]; name != "" {
+					return filepath.Base(name)
+				}
 			}
 		}
 		return ref
@@ -289,18 +292,121 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 		return err
 	}
 
+	// Try GGUF first; fall back to safetensors if the repo has none.
 	chosen, err := selectGGUF(files, tag)
-	if err != nil {
-		return err
+	if err == nil {
+		downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + chosen.Path
+		ggufDesc, err := downloadHFBlob(ctx, client, downloadURL, token, layoutDir, owner, repo, commit, chosen)
+		if err != nil {
+			return err
+		}
+		return storeHFAsOCI(layoutDir, ref, owner+"/"+repo, chosen.Path, ggufDesc)
 	}
 
-	downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + chosen.Path
-	ggufDesc, err := downloadHFBlob(ctx, client, downloadURL, token, layoutDir, owner, repo, commit, chosen)
-	if err != nil {
-		return err
+	// No GGUF found — pull safetensors files as a CNCF model-spec image.
+	return pullHFSafetensors(ctx, client, ref, layoutDir, endpoint, owner, repo, commit, token, files)
+}
+
+// safetensorsMediaType maps a file extension to the appropriate CNCF layer media type.
+func safetensorsMediaType(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".safetensors", ".bin", ".pt", ".pth":
+		return "application/vnd.cncf.model.weight.v1.raw"
+	case ".json", ".model", ".txt", ".tiktoken":
+		return "application/vnd.cncf.model.weight.config.v1.raw"
+	default:
+		return "application/vnd.cncf.model.doc.v1.raw"
+	}
+}
+
+// shouldDownloadSafetensors returns true for files that belong in a local model directory.
+func shouldDownloadSafetensors(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	ext := strings.ToLower(filepath.Ext(path))
+	// Skip hidden files, large non-model binaries, and git internals.
+	if strings.HasPrefix(base, ".") {
+		return false
+	}
+	switch ext {
+	case ".safetensors", ".bin", ".pt", ".pth": // weights
+		return true
+	case ".json", ".model", ".txt", ".tiktoken": // config / tokeniser
+		return true
+	}
+	// README and licence are useful but optional.
+	switch base {
+	case "readme.md", "license", "licence", "license.txt", "licence.txt":
+		return true
+	}
+	return false
+}
+
+func pullHFSafetensors(
+	ctx context.Context,
+	client *http.Client,
+	ref, layoutDir, endpoint, owner, repo, commit, token string,
+	files []hfFile,
+) error {
+	var toDownload []hfFile
+	for _, f := range files {
+		if f.Type == "file" && shouldDownloadSafetensors(f.Path) {
+			toDownload = append(toDownload, f)
+		}
+	}
+	if len(toDownload) == 0 {
+		return fmt.Errorf("no model files found in repository %s/%s", owner, repo)
 	}
 
-	return storeHFAsOCI(layoutDir, ref, owner+"/"+repo, chosen.Path, ggufDesc)
+	var layers []ocispec.Descriptor
+	for _, f := range toDownload {
+		url := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + f.Path
+		desc, err := downloadHFBlob(ctx, client, url, token, layoutDir, owner, repo, commit, f)
+		if err != nil {
+			return fmt.Errorf("download %s: %w", f.Path, err)
+		}
+		// Override media type and use the full relative path as the filepath annotation.
+		desc.MediaType = safetensorsMediaType(f.Path)
+		desc.Annotations = map[string]string{
+			"org.cncf.model.filepath": f.Path,
+		}
+		layers = append(layers, desc)
+	}
+
+	return storeSafetensorsAsOCI(layoutDir, ref, owner+"/"+repo, layers)
+}
+
+func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, layers []ocispec.Descriptor) error {
+	var cfg cncfModelConfig
+	cfg.Config.Format = "safetensors"
+	cfg.ModelFS.Type = "layers"
+	for _, l := range layers {
+		cfg.ModelFS.DiffIDs = append(cfg.ModelFS.DiffIDs, l.Digest.String())
+	}
+	cfgData, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal CNCF config: %w", err)
+	}
+	configDesc, err := writeBlob(layoutDir, "application/vnd.cncf.model.config.v1+json", cfgData)
+	if err != nil {
+		return fmt.Errorf("write CNCF config: %w", err)
+	}
+	manifest := ocispec.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: "application/vnd.cncf.model.manifest.v1+json",
+		Config:       configDesc,
+		Layers:       layers,
+		Annotations:  map[string]string{"ai.model.repo": modelRepo},
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	manifestDesc, err := writeBlob(layoutDir, ocispec.MediaTypeImageManifest, manifestData)
+	if err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	return updateIndex(layoutDir, ref, manifestDesc)
 }
 
 // ---------------------------------------------------------------------------
