@@ -172,14 +172,3 @@ Uses [`go.podman.io/image/v5`](https://github.com/containers/image) — the same
 cargo build --release --no-default-features --features podman
 ```
 
-## Installation
-
-### Build from source
-
-Requires Rust and Go toolchains.
-
-```
-git clone https://github.com/ericcurtin/llmman
-cd llmman
-cargo build --release
-```

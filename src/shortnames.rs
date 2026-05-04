@@ -25,12 +25,31 @@ fn aliases() -> &'static HashMap<String, String> {
     })
 }
 
-/// Resolve `reference` through the short-name alias table.
-/// Returns the full registry reference if a match is found, otherwise the
-/// input unchanged.
+/// Returns true if `reference` already carries an explicit registry host
+/// (i.e. the first path component contains a dot or equals "localhost").
+fn has_host(reference: &str) -> bool {
+    let first = reference.split('/').next().unwrap_or("");
+    first.contains('.') || first.eq_ignore_ascii_case("localhost")
+}
+
+/// Resolve `reference` through the short-name alias table, then default the
+/// registry to `hf.co` when no host is present.
+///
+/// Resolution order:
+/// 1. Exact alias match → return the mapped value
+/// 2. Reference already has a host → return as-is
+/// 3. No host → prepend `hf.co/`
+///
+/// Examples:
+/// - `"qwen3.5:0.8b-q4_K_M"`              → alias → `"hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M"`
+/// - `"unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M"` → no host → `"hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M"`
+/// - `"hf.co/unsloth/Qwen3.5-0.8B-GGUF"`  → has host → unchanged
 pub fn resolve(reference: &str) -> String {
-    aliases()
-        .get(reference)
-        .cloned()
-        .unwrap_or_else(|| reference.to_owned())
+    if let Some(mapped) = aliases().get(reference) {
+        return mapped.clone();
+    }
+    if has_host(reference) {
+        return reference.to_owned();
+    }
+    format!("hf.co/{reference}")
 }
