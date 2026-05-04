@@ -447,8 +447,27 @@ async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
     }
 }
 
+/// Resolve a user-supplied model ref to the canonical reference stored in the
+/// OCI index (e.g. "hf.co/repo" → "hf.co/repo:latest").  Using the canonical
+/// form as the map key means "hf.co/repo" and "hf.co/repo:latest" both hit
+/// the same running process rather than spawning a second one.
+fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
+    let Ok(store) = crate::storage::OciStore::open(store_path) else { return model_ref.to_owned() };
+    let Ok(desc)  = store.find(model_ref)                        else { return model_ref.to_owned() };
+    desc.annotations
+        .as_ref()
+        .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+        .cloned()
+        .unwrap_or_else(|| model_ref.to_owned())
+}
+
 async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
-    let model_ref = &crate::shortnames::resolve(model_ref);
+    let model_ref = crate::shortnames::resolve(model_ref);
+    // Normalise to the canonical stored reference so that "model" and
+    // "model:latest" always share the same entry in mgr.running.
+    let model_ref = canonical_ref(&state.0.store_path, &model_ref);
+    let model_ref = model_ref.as_str();
+
     let mut mgr = state.0.manager.lock().await;
     if let Some(m) = mgr.running.get(model_ref) {
         return Ok(m.port);
