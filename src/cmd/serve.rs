@@ -409,9 +409,6 @@ async fn spawn_llama_server(
             &port.to_string(),
             "--host",
             "127.0.0.1",
-            "--n-gpu-layers", "999",   // use all GPU layers (Metal/CUDA); safe fallback to CPU
-            "--ctx-size",     "8192", // 8k is plenty when thinking is off
-            "--parallel",     "1",    // single slot — llmman serve is single-model, sequential
             "--reasoning",    "off",  // disable thinking/reasoning mode globally; thinking models
                                       // otherwise fill the entire context with reasoning tokens
                                       // and produce empty visible responses
