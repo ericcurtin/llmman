@@ -300,138 +300,163 @@ fn gen_id() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// GGUF resolution – find and extract the model file from the OCI store
+// Model resolution – GGUF (llama-server) or safetensors (vllm)
 // ---------------------------------------------------------------------------
 
-// Media type used by HuggingFace GGUF blobs — the blob IS the raw GGUF file.
 const HF_GGUF_MEDIA_TYPE: &str = "application/vnd.docker.ai.gguf.v3";
 
-fn resolve_gguf(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow::Result<PathBuf> {
+/// What kind of model did we find in the OCI store?
+enum ModelPath {
+    /// A GGUF file — serve with llama-server.
+    Gguf(PathBuf),
+    /// A safetensors directory — serve with vllm.
+    SafeTensors(PathBuf),
+}
+
+fn layer_filepath(l: &crate::storage::oci::Descriptor) -> Option<&str> {
+    l.annotations.as_ref().and_then(|a| {
+        a.get("org.cncf.model.filepath")
+            .or_else(|| a.get("org.opencontainers.image.title"))
+            .map(|s| s.as_str())
+    })
+}
+
+fn is_gguf_layer(l: &crate::storage::oci::Descriptor) -> bool {
+    if l.media_type == HF_GGUF_MEDIA_TYPE { return true; }
+    layer_filepath(l).map(|p| p.to_lowercase().ends_with(".gguf")).unwrap_or(false)
+}
+
+fn is_safetensors_layer(l: &crate::storage::oci::Descriptor) -> bool {
+    layer_filepath(l).map(|p| p.to_lowercase().ends_with(".safetensors")).unwrap_or(false)
+}
+
+fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow::Result<ModelPath> {
     let store = OciStore::open(store_path)?;
     let desc = store
         .find(model_ref)
         .with_context(|| format!("model not found in store: {model_ref}"))?;
-
     let manifest = store.read_manifest(&desc.digest)?;
 
-    // Find the first layer that is (or contains) a GGUF file.
-    // We check several annotations because different image formats use different keys:
-    //   - HF/Docker AI:  org.opencontainers.image.title  (e.g. "model.gguf")
-    //   - CNCF modelpack: org.cncf.model.filepath         (e.g. "model-dir/model.gguf")
-    // We also accept the HF GGUF media type directly regardless of annotation.
-    let is_gguf_layer = |l: &crate::storage::oci::Descriptor| -> bool {
-        if l.media_type == HF_GGUF_MEDIA_TYPE {
-            return true;
-        }
-        let ann = l.annotations.as_ref();
-        let ends_gguf = |key: &str| {
-            ann.and_then(|a| a.get(key))
-                .map(|v| v.to_lowercase().ends_with(".gguf"))
-                .unwrap_or(false)
-        };
-        ends_gguf("org.opencontainers.image.title")
-            || ends_gguf("org.cncf.model.filepath")
-    };
+    // ── GGUF → llama-server ────────────────────────────────────────────────
+    if let Some(gguf_layer) = manifest.layers.iter().find(|l| is_gguf_layer(l)) {
+        let title = layer_filepath(gguf_layer).unwrap_or("model.gguf").to_owned();
+        let (_, layer_hex) = gguf_layer.digest.split_once(':')
+            .ok_or_else(|| anyhow!("malformed digest: {}", gguf_layer.digest))?;
 
-    let gguf_layer = manifest.layers.iter().find(|l| is_gguf_layer(l))
-        .ok_or_else(|| {
-            // Collect the actual file extensions present to give a useful error.
-            let found: Vec<String> = {
-                let mut exts = std::collections::HashSet::new();
-                for l in &manifest.layers {
-                    if let Some(ann) = &l.annotations {
-                        let path = ann.get("org.cncf.model.filepath")
-                            .or_else(|| ann.get("org.opencontainers.image.title"));
-                        if let Some(p) = path {
-                            if let Some(e) = std::path::Path::new(p).extension().and_then(|e| e.to_str()) {
-                                exts.insert(e.to_lowercase());
-                            }
-                        }
-                    }
+        // HF blobs are stored as raw GGUF — use directly.
+        if gguf_layer.media_type == HF_GGUF_MEDIA_TYPE {
+            let blob_path = store_path.join("blobs").join("sha256").join(layer_hex);
+            if blob_path.exists() {
+                eprintln!("[llmman] using blob directly: {}", blob_path.display());
+                return Ok(ModelPath::Gguf(blob_path));
+            }
+        }
+
+        // Otherwise extract from tar layer.
+        let cached_dir = cache_path.join(layer_hex);
+        if cached_dir.exists() {
+            for e in std::fs::read_dir(&cached_dir)?.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                    return Ok(ModelPath::Gguf(p));
                 }
-                exts.into_iter().collect()
-            };
-            if found.is_empty() {
-                anyhow!("no GGUF layer found in {model_ref} — llmman serve requires a GGUF model")
-            } else {
-                anyhow!(
-                    "no GGUF layer found in {model_ref} — \
-                     model contains {found:?} files; llmman serve requires a GGUF model"
-                )
-            }
-        })?;
-
-    let title = gguf_layer.annotations.as_ref()
-        .and_then(|a| {
-            a.get("org.opencontainers.image.title")
-                .or_else(|| a.get("org.cncf.model.filepath"))
-        })
-        .cloned()
-        .unwrap_or_else(|| "model.gguf".into());
-
-    let (_, layer_hex) = gguf_layer
-        .digest
-        .split_once(':')
-        .ok_or_else(|| anyhow!("malformed digest: {}", gguf_layer.digest))?;
-
-    // Fast path: HF blobs are raw GGUF files stored directly in the blob store.
-    // No extraction needed — hand the blob path straight to llama-server.
-    if gguf_layer.media_type == HF_GGUF_MEDIA_TYPE {
-        let blob_path = store_path
-            .join("blobs")
-            .join("sha256")
-            .join(layer_hex);
-        if blob_path.exists() {
-            eprintln!("[llmman] using blob directly: {}", blob_path.display());
-            return Ok(blob_path);
-        }
-    }
-
-    // Slow path: layer is a tar archive (llmman build images).
-    // Extract the .gguf entry to a content-addressed cache directory.
-    let cached_dir = cache_path.join(layer_hex);
-    if cached_dir.exists() {
-        for entry in std::fs::read_dir(&cached_dir)?.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                return Ok(p);
             }
         }
+        std::fs::create_dir_all(&cached_dir)?;
+        let blob = store.read_blob(&gguf_layer.digest)
+            .with_context(|| format!("read blob {}", gguf_layer.digest))?;
+        let dest = if blob.len() >= 4 && &blob[..4] == b"GGUF" {
+            let name = Path::new(&title).file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
+            let p = cached_dir.join(name);
+            std::fs::write(&p, &blob)?;
+            p
+        } else {
+            let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
+            let mut extracted = None;
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let ep = entry.path()?.to_path_buf();
+                if ep.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                    let name = ep.file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
+                    let d = cached_dir.join(name);
+                    entry.unpack(&d)?;
+                    extracted = Some(d);
+                    break;
+                }
+            }
+            extracted.ok_or_else(|| anyhow!("no .gguf in tar layer of {model_ref}"))?
+        };
+        return Ok(ModelPath::Gguf(dest));
     }
-    std::fs::create_dir_all(&cached_dir)?;
 
-    let blob = store
-        .read_blob(&gguf_layer.digest)
-        .with_context(|| format!("read blob {}", gguf_layer.digest))?;
+    // ── safetensors → vllm ────────────────────────────────────────────────
+    if manifest.layers.iter().any(|l| is_safetensors_layer(l)) {
+        let model_dir = extract_safetensors_dir(&store, store_path, cache_path, &desc.digest, &manifest)?;
+        return Ok(ModelPath::SafeTensors(model_dir));
+    }
 
-    // Detect: raw GGUF (magic bytes) or tar
-    let dest = if blob.len() >= 4 && &blob[..4] == b"GGUF" {
-        let name = Path::new(&title)
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
-        let p = cached_dir.join(name);
-        std::fs::write(&p, &blob)?;
-        p
+    // Nothing usable found — report what was present.
+    let exts: std::collections::HashSet<String> = manifest.layers.iter()
+        .filter_map(|l| layer_filepath(l))
+        .filter_map(|p| Path::new(p).extension()?.to_str().map(|e| e.to_lowercase()))
+        .collect();
+    if exts.is_empty() {
+        anyhow::bail!("no servable model layer found in {model_ref}");
     } else {
-        let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
-        let mut extracted: Option<PathBuf> = None;
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let entry_path = entry.path()?.to_path_buf();
-            if entry_path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                let name = entry_path
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
-                let dest = cached_dir.join(name);
-                entry.unpack(&dest)?;
-                extracted = Some(dest);
-                break;
-            }
-        }
-        extracted.ok_or_else(|| anyhow!("no .gguf file found in tar layer of {model_ref}"))?
-    };
+        anyhow::bail!(
+            "no servable model layer in {model_ref} — found {exts:?} files; \
+             llmman serve supports GGUF (llama-server) and safetensors (vllm)"
+        );
+    }
+}
 
-    Ok(dest)
+/// Extract CNCF-format safetensors layers to a cache directory and return the
+/// model directory (parent of `config.json`).
+fn extract_safetensors_dir(
+    store: &OciStore,
+    store_path: &Path,
+    cache_path: &Path,
+    manifest_digest: &str,
+    manifest: &crate::storage::oci::Manifest,
+) -> anyhow::Result<PathBuf> {
+    let (_, hex) = manifest_digest.split_once(':')
+        .ok_or_else(|| anyhow!("malformed manifest digest"))?;
+    let cache_dir = cache_path.join(hex);
+
+    for layer in &manifest.layers {
+        // Only extract config and weight files; skip code/docs.
+        let include = matches!(
+            layer.media_type.as_str(),
+            "application/vnd.cncf.model.weight.config.v1.raw"
+            | "application/vnd.cncf.model.weight.v1.raw"
+        );
+        if !include { continue; }
+
+        let Some(rel_path) = layer_filepath(layer) else { continue };
+        let dest = cache_dir.join(rel_path);
+        if dest.exists() { continue; }
+
+        std::fs::create_dir_all(dest.parent().context("no parent")?)?;
+        let (_, layer_hex) = layer.digest.split_once(':')
+            .ok_or_else(|| anyhow!("malformed layer digest"))?;
+        let blob = store_path.join("blobs").join("sha256").join(layer_hex);
+        std::fs::copy(&blob, &dest)
+            .with_context(|| format!("copy {rel_path} from blob store"))?;
+        eprintln!("[llmman] extracted {rel_path}");
+    }
+
+    // Model dir = parent of config.json
+    for layer in &manifest.layers {
+        let Some(rel_path) = layer_filepath(layer) else { continue };
+        if Path::new(rel_path).file_name().map(|n| n == "config.json").unwrap_or(false) {
+            let config = cache_dir.join(rel_path);
+            return config.parent().map(|p| p.to_path_buf())
+                .ok_or_else(|| anyhow!("config.json has no parent directory"));
+        }
+    }
+    Ok(cache_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,23 +487,48 @@ async fn spawn_llama_server(
         .with_context(|| format!("spawn llama-server from {}", bin.display()))
 }
 
-async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
-    let url = format!("http://127.0.0.1:{port}/health");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if Instant::now() > deadline {
-            return Err(anyhow!("llama-server on port {port} did not become ready within 120s"));
-        }
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                // llama-server returns {"status":"ok"} when ready
-                if text.contains("\"ok\"") {
-                    return Ok(());
-                }
+async fn spawn_vllm_server(model_dir: &Path, port: u16) -> anyhow::Result<tokio::process::Child> {
+    let vllm = which_binary("vllm")?;
+    tokio::process::Command::new(&vllm)
+        .args([
+            "serve",
+            model_dir.to_str().context("non-UTF-8 model path")?,
+            "--port", &port.to_string(),
+            "--host", "127.0.0.1",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawn vllm from {}", vllm.display()))
+}
+
+fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
+    if let Ok(out) = std::process::Command::new("which").arg(name).output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() {
+                return Ok(PathBuf::from(p));
             }
         }
-        sleep(Duration::from_millis(250)).await;
+    }
+    anyhow::bail!("{name} not found on PATH")
+}
+
+async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    // vllm can take several minutes to load large models.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if Instant::now() > deadline {
+            return Err(anyhow!("inference server on port {port} did not become ready within 600s"));
+        }
+        if let Ok(resp) = client.get(&url).send().await {
+            // llama-server: 200 + {"status":"ok"}   vllm: 200 + {}
+            // Both return HTTP 200 only when fully ready.
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -507,11 +557,16 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     if let Some(m) = mgr.running.get(model_ref) {
         return Ok(m.port);
     }
-    let gguf = resolve_gguf(&state.0.store_path, &state.0.cache_path, model_ref)
+    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
     let port = find_free_port()?;
     eprintln!("[llmman] loading {model_ref} on port {port}");
-    let child = spawn_llama_server(&state.0.llama_server_bin, &gguf, port).await?;
+    let child = match model_path {
+        ModelPath::Gguf(ref path) =>
+            spawn_llama_server(&state.0.llama_server_bin, path, port).await?,
+        ModelPath::SafeTensors(ref dir) =>
+            spawn_vllm_server(dir, port).await?,
+    };
     wait_for_ready(&state.0.client, port).await?;
     eprintln!("[llmman] {model_ref} ready on port {port}");
     mgr.running
