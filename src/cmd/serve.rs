@@ -558,12 +558,43 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 
 async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
     let model_ref = crate::shortnames::resolve(model_ref);
-    // Normalise to the canonical stored reference so that "model" and
-    // "model:latest" always share the same entry in mgr.running.
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
+    // Fast path: model already running.
+    {
+        let mgr = state.0.manager.lock().await;
+        if let Some(m) = mgr.running.get(model_ref) {
+            return Ok(m.port);
+        }
+    } // mutex released before any I/O
+
+    // If the model is not in the local store, pull it now.
+    // Runs outside the mutex so multi-GB downloads don't block other requests.
+    if crate::storage::OciStore::open(&state.0.store_path)
+        .and_then(|s| s.find(model_ref))
+        .is_err()
+    {
+        eprintln!("[llmman] {model_ref} not in store — pulling");
+        let store_path = state.0.store_path.clone();
+        let model_ref_owned = model_ref.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let layout = store_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 store path"))?;
+            crate::ffi::pull(&model_ref_owned, layout)
+        })
+        .await
+        .context("pull task panicked")?
+        .context("pull failed")?;
+    }
+
+    // Re-canonicalise after the pull (tag may now be resolvable).
+    let model_ref = canonical_ref(&state.0.store_path, model_ref);
+    let model_ref = model_ref.as_str();
+
     let mut mgr = state.0.manager.lock().await;
+    // Double-check: another task may have started the server while we were pulling.
     if let Some(m) = mgr.running.get(model_ref) {
         return Ok(m.port);
     }
