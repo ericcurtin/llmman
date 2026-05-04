@@ -487,7 +487,7 @@ async fn spawn_llama_server(
         .with_context(|| format!("spawn llama-server from {}", bin.display()))
 }
 
-async fn spawn_vllm_server(model_dir: &Path, port: u16) -> anyhow::Result<tokio::process::Child> {
+async fn spawn_vllm_server(model_dir: &Path, port: u16, model_name: &str) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
     tokio::process::Command::new(&vllm)
         .args([
@@ -495,6 +495,9 @@ async fn spawn_vllm_server(model_dir: &Path, port: u16) -> anyhow::Result<tokio:
             model_dir.to_str().context("non-UTF-8 model path")?,
             "--port", &port.to_string(),
             "--host", "127.0.0.1",
+            // Register the model under the same name used in API requests so
+            // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
+            "--served-model-name", model_name,
         ])
         .kill_on_drop(true)
         .spawn()
@@ -565,7 +568,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         ModelPath::Gguf(ref path) =>
             spawn_llama_server(&state.0.llama_server_bin, path, port).await?,
         ModelPath::SafeTensors(ref dir) =>
-            spawn_vllm_server(dir, port).await?,
+            spawn_vllm_server(dir, port, model_ref).await?,
     };
     wait_for_ready(&state.0.client, port).await?;
     eprintln!("[llmman] {model_ref} ready on port {port}");
@@ -633,12 +636,12 @@ async fn collect_completion(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+        return Err(AppError(anyhow!("inference backend {status}: {body}")));
     }
     let raw = resp.bytes().await.context("read llama-server response")?;
     eprintln!("[llmman] llama-server raw {} bytes", raw.len());
     if raw.is_empty() {
-        return Err(AppError(anyhow!("llama-server returned empty response body")));
+        return Err(AppError(anyhow!("inference backend returned empty response body")));
     }
 
     let text = String::from_utf8_lossy(&raw);
@@ -741,7 +744,7 @@ async fn stream_ollama_chat(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+        return Err(AppError(anyhow!("inference backend {status}: {body}")));
     }
 
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
@@ -786,7 +789,7 @@ async fn stream_ollama_generate(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+        return Err(AppError(anyhow!("inference backend {status}: {body}")));
     }
 
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
@@ -832,7 +835,7 @@ async fn stream_anthropic(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("llama-server {status}: {body}")));
+        return Err(AppError(anyhow!("inference backend {status}: {body}")));
     }
 
     let msg_id = gen_id();
