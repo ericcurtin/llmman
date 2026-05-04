@@ -287,11 +287,17 @@ impl OciStore {
                     .ok()
                     .and_then(|p| fs::metadata(p).ok())
                     .and_then(|meta| meta.modified().ok());
+                // Sum the layer sizes from the manifest rather than using the
+                // manifest blob size (which is only a few hundred bytes).
+                let size = self
+                    .read_manifest(&m.digest)
+                    .map(|manifest| manifest.layers.iter().map(|l| l.size).sum())
+                    .unwrap_or(m.size);
                 ImageSummary {
                     reference,
                     digest: m.digest,
                     media_type: m.media_type,
-                    size: m.size,
+                    size,
                     modified_at,
                 }
             })
