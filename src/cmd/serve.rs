@@ -940,18 +940,7 @@ async fn handle_ollama_chat(
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    let content = collect_completion(&state.0.client, &url, oai).await?;
-    Ok(Json(OllamaChatChunk {
-        model: req.model,
-        created_at: now_rfc3339(),
-        message: OllamaMessage {
-            role: "assistant".into(),
-            content,
-        },
-        done: true,
-        done_reason: Some("stop".into()),
-    })
-    .into_response())
+    stream_ollama_chat(state.0.client.clone(), url, oai, req.model).await
 }
 
 // -- Ollama /api/generate -----------------------------------------------------
@@ -974,15 +963,7 @@ async fn handle_ollama_generate(
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    let content = collect_completion(&state.0.client, &url, oai).await?;
-    Ok(Json(OllamaGenerateChunk {
-        model: req.model,
-        created_at: now_rfc3339(),
-        response: content,
-        done: true,
-        done_reason: Some("stop".into()),
-    })
-    .into_response())
+    stream_ollama_generate(state.0.client.clone(), url, oai, req.model).await
 }
 
 // -- OpenAI pass-through handlers --------------------------------------------
