@@ -314,23 +314,58 @@ fn resolve_gguf(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow
 
     let manifest = store.read_manifest(&desc.digest)?;
 
-    // Find the first layer whose title ends with .gguf
-    let gguf_layer = manifest
-        .layers
-        .iter()
-        .find(|l| {
-            l.annotations
-                .as_ref()
-                .and_then(|a| a.get("org.opencontainers.image.title"))
-                .map(|t| t.ends_with(".gguf"))
+    // Find the first layer that is (or contains) a GGUF file.
+    // We check several annotations because different image formats use different keys:
+    //   - HF/Docker AI:  org.opencontainers.image.title  (e.g. "model.gguf")
+    //   - CNCF modelpack: org.cncf.model.filepath         (e.g. "model-dir/model.gguf")
+    // We also accept the HF GGUF media type directly regardless of annotation.
+    let is_gguf_layer = |l: &crate::storage::oci::Descriptor| -> bool {
+        if l.media_type == HF_GGUF_MEDIA_TYPE {
+            return true;
+        }
+        let ann = l.annotations.as_ref();
+        let ends_gguf = |key: &str| {
+            ann.and_then(|a| a.get(key))
+                .map(|v| v.to_lowercase().ends_with(".gguf"))
                 .unwrap_or(false)
-        })
-        .ok_or_else(|| anyhow!("no .gguf layer in model {model_ref}"))?;
+        };
+        ends_gguf("org.opencontainers.image.title")
+            || ends_gguf("org.cncf.model.filepath")
+    };
 
-    let title = gguf_layer
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get("org.opencontainers.image.title"))
+    let gguf_layer = manifest.layers.iter().find(|l| is_gguf_layer(l))
+        .ok_or_else(|| {
+            // Collect the actual file extensions present to give a useful error.
+            let found: Vec<String> = {
+                let mut exts = std::collections::HashSet::new();
+                for l in &manifest.layers {
+                    if let Some(ann) = &l.annotations {
+                        let path = ann.get("org.cncf.model.filepath")
+                            .or_else(|| ann.get("org.opencontainers.image.title"));
+                        if let Some(p) = path {
+                            if let Some(e) = std::path::Path::new(p).extension().and_then(|e| e.to_str()) {
+                                exts.insert(e.to_lowercase());
+                            }
+                        }
+                    }
+                }
+                exts.into_iter().collect()
+            };
+            if found.is_empty() {
+                anyhow!("no GGUF layer found in {model_ref} — llmman serve requires a GGUF model")
+            } else {
+                anyhow!(
+                    "no GGUF layer found in {model_ref} — \
+                     model contains {found:?} files; llmman serve requires a GGUF model"
+                )
+            }
+        })?;
+
+    let title = gguf_layer.annotations.as_ref()
+        .and_then(|a| {
+            a.get("org.opencontainers.image.title")
+                .or_else(|| a.get("org.cncf.model.filepath"))
+        })
         .cloned()
         .unwrap_or_else(|| "model.gguf".into());
 
