@@ -956,6 +956,20 @@ async fn handle_ollama_generate(
 ) -> Result<Response, AppError> {
     eprintln!("[llmman] /api/generate model={:?} prompt_len={}", req.model, req.prompt.len());
     let port = ensure_model(&state, &req.model).await?;
+    // Empty prompt = load-only request (matches ollama server/routes.go:429).
+    // scheduleRunner (ensure_model) has already loaded the model above.
+    if req.prompt.is_empty() {
+        return Ok(Json(OllamaGenerateChunk {
+            model: req.model,
+            created_at: now_rfc3339(),
+            response: String::new(),
+            thinking: None,
+            done: true,
+            done_reason: Some("load".into()),
+        })
+        .into_response());
+    }
+
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
         model: req.model.clone(),
