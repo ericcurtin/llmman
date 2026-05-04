@@ -89,7 +89,7 @@ Default locations (override with `--store <DIR>`):
 | Linux, macOS | `~/.local/share/llmman/store` |
 | Windows | `%LOCALAPPDATA%\llmman\store` |
 
-The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker`, `podman`, and `skopeo` directly.
+The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
 ## Transport backends
 

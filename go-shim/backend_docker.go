@@ -15,7 +15,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,11 +26,8 @@ import (
 	"github.com/containerd/errdefs"
 	dockercliconfig "github.com/docker/cli/cli/config"
 	clitypes "github.com/docker/cli/cli/config/types"
-	digest "github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -64,177 +60,6 @@ func newResolver(ctx context.Context) remotes.Resolver {
 // ---------------------------------------------------------------------------
 // OCI layout helpers
 // ---------------------------------------------------------------------------
-
-// blobPath returns the path for a blob in an OCI image layout directory.
-func blobPath(layoutDir string, dgst digest.Digest) string {
-	return filepath.Join(layoutDir, "blobs", dgst.Algorithm().String(), dgst.Hex())
-}
-
-// readBlob reads a blob from an OCI layout directory.
-func readBlob(layoutDir string, dgst digest.Digest) ([]byte, error) {
-	return os.ReadFile(blobPath(layoutDir, dgst))
-}
-
-// writeBlob atomically writes data to the OCI layout blobs directory,
-// verifying the digest matches.  Returns the descriptor.
-func writeBlob(layoutDir string, mediaType string, data []byte) (ocispec.Descriptor, error) {
-	dgst := digest.FromBytes(data)
-	dir := filepath.Join(layoutDir, "blobs", dgst.Algorithm().String())
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return ocispec.Descriptor{}, err
-	}
-	dest := filepath.Join(dir, dgst.Hex())
-	// Skip if already present and correct size
-	if fi, err := os.Stat(dest); err == nil && fi.Size() == int64(len(data)) {
-		return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}, nil
-	}
-	tmp := dest + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return ocispec.Descriptor{}, err
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		return ocispec.Descriptor{}, err
-	}
-	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}, nil
-}
-
-// writeBlobStream writes a large stream to the OCI layout blobs directory.
-// dgst is the expected digest; the blob is skipped if already complete, and
-// the computed digest is verified against dgst before the file is committed.
-// A deterministic <dest>.part file is used so interrupted downloads are
-// identifiable.
-//
-// partOffset is the number of bytes already present in the .part file from a
-// previous interrupted download (the caller must have already seeked r to that
-// offset).  When > 0, the function opens the .part file in append mode and
-// seeds the digest hasher by streaming the existing bytes so the final digest
-// can still be verified end-to-end.
-func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst digest.Digest, partOffset int64) (ocispec.Descriptor, error) {
-	dir := filepath.Join(layoutDir, "blobs", dgst.Algorithm().String())
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return ocispec.Descriptor{}, err
-	}
-	dest := filepath.Join(dir, dgst.Hex())
-	// Skip if already complete
-	if fi, err := os.Stat(dest); err == nil && (size <= 0 || fi.Size() == size) {
-		return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: fi.Size()}, nil
-	}
-	tmp := dest + ".part"
-	digester := digest.Canonical.Digester()
-	var f *os.File
-	startOffset := int64(0)
-
-	if partOffset > 0 {
-		// Seed the hasher with the already-downloaded bytes so we can verify the
-		// full digest at the end, then open the file for appending.
-		if pf, err := os.Open(tmp); err == nil {
-			_, hashErr := io.Copy(digester.Hash(), pf)
-			pf.Close()
-			if hashErr == nil {
-				f, err = os.OpenFile(tmp, os.O_APPEND|os.O_WRONLY, 0o644)
-				if err == nil {
-					startOffset = partOffset
-				}
-			}
-		}
-		if f == nil {
-			digester = digest.Canonical.Digester() // reset on any failure
-		}
-	}
-
-	if f == nil {
-		var err error
-		if f, err = os.Create(tmp); err != nil {
-			return ocispec.Descriptor{}, err
-		}
-	}
-
-	written, err := io.Copy(io.MultiWriter(f, digester.Hash()), r)
-	f.Close()
-	if err != nil {
-		os.Remove(tmp)
-		return ocispec.Descriptor{}, err
-	}
-	total := startOffset + written
-	if size > 0 && total != size {
-		os.Remove(tmp)
-		return ocispec.Descriptor{}, fmt.Errorf("size mismatch: expected %d got %d", size, total)
-	}
-	if got := digester.Digest(); got != dgst {
-		os.Remove(tmp)
-		return ocispec.Descriptor{}, fmt.Errorf("digest mismatch: expected %s got %s", dgst, got)
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		os.Remove(tmp)
-		return ocispec.Descriptor{}, err
-	}
-	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: total}, nil
-}
-
-// blobExists reports whether a blob is already fully stored in the layout.
-func blobExists(layoutDir string, desc ocispec.Descriptor) bool {
-	fi, err := os.Stat(blobPath(layoutDir, desc.Digest))
-	return err == nil && fi.Size() == desc.Size
-}
-
-// readIndex reads index.json from an OCI layout directory.
-func readIndex(layoutDir string) (ocispec.Index, error) {
-	data, err := os.ReadFile(filepath.Join(layoutDir, "index.json"))
-	if err != nil {
-		return ocispec.Index{}, err
-	}
-	var idx ocispec.Index
-	return idx, json.Unmarshal(data, &idx)
-}
-
-// writeIndex writes index.json to an OCI layout directory.
-func writeIndex(layoutDir string, idx ocispec.Index) error {
-	data, err := json.MarshalIndent(idx, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(layoutDir, "index.json"), data, 0o644)
-}
-
-// ensureLayout initialises the OCI layout marker files if not present.
-func ensureLayout(layoutDir string) error {
-	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
-		return err
-	}
-	markerPath := filepath.Join(layoutDir, "oci-layout")
-	if _, err := os.Stat(markerPath); os.IsNotExist(err) {
-		marker := `{"imageLayoutVersion":"1.0.0"}`
-		if err := os.WriteFile(markerPath, []byte(marker), 0o644); err != nil {
-			return err
-		}
-	}
-	indexPath := filepath.Join(layoutDir, "index.json")
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		idx := ocispec.Index{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: ocispec.MediaTypeImageIndex,
-		}
-		return writeIndex(layoutDir, idx)
-	}
-	return nil
-}
-
-// findManifestDesc looks up the manifest descriptor for a ref name in the index.
-// Falls back to the first entry if there is only one and no explicit tag was given.
-func findManifestDesc(idx ocispec.Index, refName string) (ocispec.Descriptor, error) {
-	for _, m := range idx.Manifests {
-		if m.Annotations != nil {
-			if m.Annotations[ocispec.AnnotationRefName] == refName {
-				return m, nil
-			}
-		}
-	}
-	// Fallback: single-entry index
-	if len(idx.Manifests) == 1 {
-		return idx.Manifests[0], nil
-	}
-	return ocispec.Descriptor{}, fmt.Errorf("no manifest found for %q", refName)
-}
 
 // ---------------------------------------------------------------------------
 // ociProvider implements content.Provider backed by an OCI layout directory.
@@ -283,39 +108,6 @@ func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider,
 	defer ra.Close()
 
 	return content.Copy(ctx, cw, io.NewSectionReader(ra, 0, ra.Size()), desc.Size, desc.Digest)
-}
-
-// tagFromRef extracts the tag or short name portion of a registry reference.
-// e.g. "registry.example.com/repo:tag" → "tag"
-//
-//	"registry.example.com/repo"       → "latest"
-func tagFromRef(ref string) string {
-	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
-		return ref[i+1:]
-	}
-	return "latest"
-}
-
-// addLayerBar adds a progress bar into an existing mpb.Progress, using the same
-// decorator choices as podman's utils.ProgressBar: OnComplete swaps the label to
-// the completion string and clears the byte/speed counters so the final static
-// line is always correct regardless of render-tick timing.
-func addLayerBar(p *mpb.Progress, prefix, onComplete string, size int64) *mpb.Bar {
-	bar := p.AddBar(size,
-		mpb.BarFillerClearOnComplete(),
-		mpb.PrependDecorators(
-			decor.OnComplete(decor.Name(prefix), onComplete),
-		),
-		mpb.AppendDecorators(
-			decor.OnComplete(decor.CountersKibiByte("% .1f / % .1f"), ""),
-			decor.OnComplete(decor.Name("  "), ""),
-			decor.OnComplete(decor.AverageSpeed(decor.SizeB1024(0), "% .1f"), ""),
-		),
-	)
-	if size <= 0 {
-		bar.SetTotal(0, true)
-	}
-	return bar
 }
 
 // ---------------------------------------------------------------------------
@@ -569,45 +361,6 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		return errResp(err)
 	}
 	return okResp("")
-}
-
-// updateIndex adds or replaces the manifest entry in index.json.
-// An exclusive advisory lock on index.json.lock serialises concurrent callers
-// across processes on Linux, macOS, and Windows.
-func updateIndex(layoutDir, ref string, manifestDesc ocispec.Descriptor) error {
-	lock, err := lockIndex(layoutDir)
-	if err != nil {
-		return err
-	}
-	defer lock.release()
-
-	idx, err := readIndex(layoutDir)
-	if err != nil {
-		// New index
-		idx = ocispec.Index{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: ocispec.MediaTypeImageIndex,
-		}
-	}
-	if manifestDesc.Annotations == nil {
-		manifestDesc.Annotations = map[string]string{}
-	}
-	manifestDesc.Annotations[ocispec.AnnotationRefName] = ref
-
-	// Replace existing entry with same ref name, or append.
-	// A duplicate digest from a concurrent pull is silently accepted.
-	replaced := false
-	for i, m := range idx.Manifests {
-		if m.Annotations != nil && m.Annotations[ocispec.AnnotationRefName] == ref {
-			idx.Manifests[i] = manifestDesc
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		idx.Manifests = append(idx.Manifests, manifestDesc)
-	}
-	return writeIndex(layoutDir, idx)
 }
 
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.

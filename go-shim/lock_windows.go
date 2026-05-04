@@ -1,4 +1,4 @@
-//go:build windows && !podman
+//go:build windows
 
 package main
 

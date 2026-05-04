@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -37,13 +38,6 @@ func insecurePolicy() (*signature.PolicyContext, error) {
 		},
 	}
 	return signature.NewPolicyContext(policy)
-}
-
-func tagFromRef(ref string) string {
-	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
-		return ref[i+1:]
-	}
-	return "latest"
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +124,20 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	// Normalize: append :latest if reference has no tag or digest
 	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
 		ref = ref + ":latest"
+	}
+
+	// HuggingFace and similar hosts cannot be pulled via the OCI registry
+	// protocol (their paths contain uppercase letters which containers/image
+	// rejects).  Delegate to the shared HF pull path instead.
+	host := strings.SplitN(ref, "/", 2)[0]
+	if isKnownHFHost(host) || (!isKnownOCIHost(host) && !isOCIRegistry(context.Background(), &http.Client{Timeout: 5 * time.Second}, host)) {
+		if err := ensureLayout(layoutDir); err != nil {
+			return errResp(fmt.Errorf("init OCI layout: %w", err))
+		}
+		if err := pullHF(context.Background(), ref, layoutDir); err != nil {
+			return errResp(err)
+		}
+		return okResp("")
 	}
 
 	tag := tagFromRef(ref)
