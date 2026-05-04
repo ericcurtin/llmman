@@ -1200,7 +1200,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/v1/messages", post(handle_anthropic_messages))
         .with_state(state);
 
-    let addr = "0.0.0.0:17434";
+    let addr = "127.0.0.1:17434";
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
