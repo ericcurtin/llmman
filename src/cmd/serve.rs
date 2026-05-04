@@ -249,7 +249,9 @@ struct OAIChunkChoice {
 #[derive(Debug, Deserialize)]
 struct OAIChunkDelta {
     content: Option<String>,
-    /// llama-server sends reasoning/thinking content here when --reasoning is enabled
+    /// llama-server (Homebrew b8880) sends reasoning content in this field.
+    /// The git repo uses "thinking" — accept both for forward compatibility.
+    reasoning_content: Option<String>,
     thinking: Option<String>,
 }
 
@@ -415,9 +417,6 @@ async fn spawn_llama_server(
             &port.to_string(),
             "--host",
             "127.0.0.1",
-            // Cap thinking tokens so reasoning models don't exhaust the context.
-            // Thinking is still shown to users via message.thinking / response.thinking.
-            "--reasoning-budget", "2048",
         ])
         .kill_on_drop(true)
         .spawn()
@@ -598,7 +597,10 @@ fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)>
     let chunk = serde_json::from_str::<OAIChunk>(payload).ok()?;
     let choice = chunk.choices.first()?;
     let content = choice.delta.content.as_deref().unwrap_or("").to_string();
-    let thinking = choice.delta.thinking.clone().filter(|s| !s.is_empty());
+    // Accept both field names: "reasoning_content" (Homebrew llama-server) and "thinking" (git)
+    let thinking = choice.delta.reasoning_content.clone()
+        .or_else(|| choice.delta.thinking.clone())
+        .filter(|s| !s.is_empty());
     let done = choice
         .finish_reason
         .as_deref()
