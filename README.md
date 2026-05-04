@@ -34,7 +34,7 @@ llmman pull qwen3.5:0.8b-q4_K_M
 Or use the full reference:
 
 ```
-llmman pull hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
+llmman pull unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
 ```
 
 ### List local models
@@ -45,7 +45,7 @@ llmman ls
 
 ```
 NAME                                      ID              SIZE      MODIFIED
-hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest    b55c07040368    532.5 MB  2 hours ago
+unsloth/Qwen3.5-0.8B-GGUF:latest    b55c07040368    532.5 MB  2 hours ago
 ```
 
 ### Serve
@@ -59,7 +59,7 @@ llmman serve
 Optionally pass a model to pre-load on startup:
 
 ```
-llmman serve hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest
+llmman serve unsloth/Qwen3.5-0.8B-GGUF:latest
 ```
 
 The server listens on `127.0.0.1:17434` and exposes:
@@ -73,7 +73,7 @@ The server listens on `127.0.0.1:17434` and exposes:
 Use it as an Ollama-compatible server:
 
 ```
-OLLAMA_HOST=127.0.0.1:17434 ollama run hf.co/unsloth/Qwen3.5-0.8B-GGUF
+OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 ```
 
 Or with any OpenAI-compatible client:
@@ -82,7 +82,7 @@ Or with any OpenAI-compatible client:
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:17434/v1", api_key="unused")
 response = client.chat.completions.create(
-    model="hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest",
+    model="unsloth/Qwen3.5-0.8B-GGUF:latest",
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
@@ -94,9 +94,9 @@ Models are loaded on demand. Each model gets its own `llama-server` subprocess o
 `shortnames.conf` maps friendly names to full registry references:
 
 ```
-llmman pull qwen3.5:0.8b          # → hf.co/unsloth/Qwen3.5-0.8B-GGUF
-llmman pull gemma4:e4b-it-q4_K_M  # → hf.co/unsloth/gemma-4-E4B-it-GGUF:Q4_K_M
-llmman pull granite4.1:8b-q4_K_M  # → hf.co/unsloth/granite-4.1-8b-GGUF:Q4_K_M
+llmman pull qwen3.5:0.8b          # → unsloth/Qwen3.5-0.8B-GGUF
+llmman pull gemma4:e4b-it-q4_K_M  # → unsloth/gemma-4-E4B-it-GGUF:Q4_K_M
+llmman pull granite4.1:8b-q4_K_M  # → unsloth/granite-4.1-8b-GGUF:Q4_K_M
 ```
 
 Short names work with all commands: `pull`, `push`, `rm`, `tag`, `inspect`, and `serve`.
