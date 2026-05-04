@@ -28,7 +28,11 @@ use crate::storage::OciStore;
 // ---------------------------------------------------------------------------
 
 #[derive(Args, Debug)]
-pub struct ServeArgs {}
+pub struct ServeArgs {
+    /// Model to pre-load immediately on startup (e.g. hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest)
+    #[arg(value_name = "MODEL")]
+    pub model: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -1179,6 +1183,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         client: Client::new(),
     }));
 
+    let app_state = state.clone();
     let app = Router::new()
         // Health
         .route("/", get(handle_root))
@@ -1198,13 +1203,26 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/v1/embeddings", post(handle_openai_embeddings))
         // Anthropic API
         .route("/v1/messages", post(handle_anthropic_messages))
-        .with_state(state);
+        .with_state(app_state);
 
     let addr = "127.0.0.1:17434";
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     eprintln!("llmman serve listening on {addr}");
+
+    // If a model was given on the command line, start loading it immediately
+    // so the first request finds it already warm.
+    if let Some(model) = &_args.model {
+        let model = crate::shortnames::resolve(model);
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ensure_model(&state_clone, &model).await {
+                eprintln!("[llmman] pre-load failed: {:#}", e.0);
+            }
+        });
+    }
+
     axum::serve(listener, app).await?;
     Ok(())
 }
