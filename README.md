@@ -1,7 +1,8 @@
 # llmman
 
-A command-line tool for managing LLM model images in OCI registries.
+A command-line tool for managing and serving LLM models using OCI registries.
 Models are packaged as standard OCI artifacts and stored in any compatible registry (Docker Hub, GHCR, quay, self-hosted, etc.).
+`llmman serve` exposes Ollama-, OpenAI-, and Anthropic-compatible HTTP APIs backed by `llama-server` subprocesses.
 
 `llmman` is written in Rust and uses the same registry transport libraries as Docker or Podman selected at compile time without spawning either as a subprocess.
 
@@ -9,31 +10,117 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 
 | Command | Description |
 |---------|-------------|
-| `build` | Package model files into a local OCI image |
-| `login` | Log in to a container registry |
-| `logout` | Log out from a container registry |
-| `push` | Push a local image to a registry |
-| `pull` | Pull an image from a registry to the local store |
-| `list` | List locally stored images |
-| `rm` | Remove a local image |
+| `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
+| `pull`    | Pull a model from a registry or HuggingFace |
+| `list`    | List locally stored models |
+| `build`   | Package model files into a local OCI image |
+| `push`    | Push a local image to a registry |
+| `rm`      | Remove a local image |
+| `tag`     | Create a new local tag pointing to an existing image |
 | `inspect` | Show the manifest of a local or remote image |
-| `tag` | Create a new local tag pointing to an existing image |
+| `login`   | Log in to a container registry |
+| `logout`  | Log out from a container registry |
 
-## Installation
+## Quick start
 
-### Pre-built binaries
+### Pull a model
 
-Download the latest binary for your platform from the [releases page](../../releases).
+Pull directly from HuggingFace using short names:
 
-| Platform | File |
-|----------|------|
-| Linux x86_64 | `llmman-x86_64-unknown-linux-gnu` |
-| Linux aarch64 | `llmman-aarch64-unknown-linux-gnu` |
-| macOS aarch64 | `llmman-aarch64-apple-darwin` |
-| Windows x86_64 | `llmman-x86_64-pc-windows-msvc.exe` |
-| Windows aarch64 | `llmman-aarch64-pc-windows-msvc.exe` |
+```
+llmman pull qwen3.5:0.8b-q4_K_M
+```
 
-### Build from source
+Or use the full reference:
+
+```
+llmman pull hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
+```
+
+### List local models
+
+```
+llmman ls
+```
+
+```
+NAME                                      ID              SIZE      MODIFIED
+hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest    b55c07040368    532.5 MB  2 hours ago
+```
+
+### Serve
+
+Start the inference server. Requires `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) to be on `PATH`.
+
+```
+llmman serve
+```
+
+Optionally pass a model to pre-load on startup:
+
+```
+llmman serve hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest
+```
+
+The server listens on `127.0.0.1:17434` and exposes:
+
+| API | Endpoints |
+|-----|-----------|
+| Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` |
+| Anthropic | `/v1/messages` |
+
+Use it as an Ollama-compatible server:
+
+```
+OLLAMA_HOST=127.0.0.1:17434 ollama run hf.co/unsloth/Qwen3.5-0.8B-GGUF
+```
+
+Or with any OpenAI-compatible client:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:17434/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+Models are loaded on demand. Each model gets its own `llama-server` subprocess on a random loopback port; subsequent requests reuse the running process.
+
+## Short names
+
+`shortnames.conf` maps friendly names to full registry references:
+
+```
+llmman pull qwen3.5:0.8b          # → hf.co/unsloth/Qwen3.5-0.8B-GGUF
+llmman pull gemma4:e4b-it-q4_K_M  # → hf.co/unsloth/gemma-4-E4B-it-GGUF:Q4_K_M
+llmman pull granite4.1:8b-q4_K_M  # → hf.co/unsloth/granite-4.1-8b-GGUF:Q4_K_M
+```
+
+Short names work with all commands: `pull`, `push`, `rm`, `tag`, `inspect`, and `serve`.
+
+## Registry operations
+
+### Authenticate
+
+```
+llmman login registry.example.com -u alice
+# prompts for password
+
+llmman logout registry.example.com
+```
+
+Credentials are stored in the Docker credential store (`~/.docker/config.json`), shared with `docker` and `podman`.
+
+### Push and pull (OCI registries)
+
+```
+llmman push registry.example.com/mymodel:v1
+
+llmman pull registry.example.com/mymodel:v1
+```
 
 ### Build a model image
 
@@ -43,117 +130,56 @@ Package every file in a directory as a set of OCI layers:
 llmman build -t registry.example.com/mymodel:v1 ./path/to/model/
 ```
 
-Add metadata labels:
-
-```
-llmman build -t registry.example.com/mymodel:v1 \
-  -l org.llmman.format=gguf \
-  -l org.llmman.quantization=q4_k_m \
-  ./path/to/model/
-```
-
-### Authenticate
-
-```
-llmman login registry.example.com -u alice
-# prompts for password
-
-llmman login registry.example.com -u alice -p mypassword
-
-llmman logout registry.example.com
-```
-
-Credentials are stored in the Docker credential store (`~/.docker/config.json`), so they are shared with `docker` and `podman` when using the default Docker backend.
-
-### Push and pull
-
-```
-llmman push registry.example.com/mymodel:v1
-
-llmman pull registry.example.com/mymodel:v1
-```
-
-### List local images
-
-```
-llmman list
-```
-
-```
-NAME                                      ID                  SIZE          MODIFIED
-hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M    b55c07040368        591 B         just now
-```
-
-### Tag
-
-Create an additional local reference without re-building:
+### Tag, remove, inspect
 
 ```
 llmman tag registry.example.com/mymodel:v1 registry.example.com/mymodel:latest
-```
 
-### Remove
-
-```
 llmman rm registry.example.com/mymodel:v1
 
-# remove multiple at once
-llmman rm registry.example.com/mymodel:v1 registry.example.com/mymodel:latest
-```
-
-### Inspect
-
-Local manifest:
-
-```
 llmman inspect registry.example.com/mymodel:v1
-```
-
-Remote manifest (fetches directly from the registry, no local copy needed):
-
-```
 llmman inspect --remote registry.example.com/mymodel:v1
 ```
 
-### Custom store location
+## Store location
 
-All commands accept `--store <DIR>` to override the default local store location.
-
-Default locations:
+Default locations (override with `--store <DIR>`):
 
 | OS | Path |
 |----|------|
 | Linux, macOS | `~/.local/share/llmman/store` |
 | Windows | `%LOCALAPPDATA%\llmman\store` |
 
-The store uses the [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) format, so it is readable by `docker`, `podman`, and `skopeo` directly.
+The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker`, `podman`, and `skopeo` directly.
 
 ## Transport backends
 
-The registry transport is provided by a compiled-in Go shim. Two backends are available, selected at build time via a Cargo feature flag.
+The registry transport is a compiled-in Go shim. Two backends are available via Cargo feature flags.
 
 ### Docker (default)
 
-Uses [`github.com/containerd/containerd/v2/core/remotes/docker`](https://github.com/containerd/containerd) — the same OCI registry resolver used by moby/Docker — together with `github.com/docker/cli/cli/config` for credential storage.
+Uses [`github.com/containerd/containerd`](https://github.com/containerd/containerd) — the same OCI resolver used by Docker.
 
 ```
-cargo build --release                          # docker backend (default)
-cargo build --release --features docker        # explicit
+cargo build --release
 ```
 
 ### Podman
 
-Uses [`go.podman.io/image/v5`](https://github.com/containers/image) and [`go.podman.io/common/pkg/auth`](https://github.com/containers/common) — the same libraries Podman uses internally.
+Uses [`go.podman.io/image/v5`](https://github.com/containers/image) — the same library Podman uses internally.
 
 ```
 cargo build --release --no-default-features --features podman
 ```
 
-> The Podman backend is not built for Windows targets in CI, as `containers/image` has limited Windows support.
+## Installation
 
-## Local image format
+### Build from source
 
-Each file in the source directory becomes a separate uncompressed tar layer (`application/vnd.oci.image.layer.v1.tar`) with its relative path recorded in the `org.opencontainers.image.title` annotation. A JSON config blob records the creation timestamp, host architecture, OS, and any user-supplied labels.
+Requires Rust and Go toolchains.
 
-This structure is intentionally simple and compatible with any OCI-compliant tool.
-
+```
+git clone https://github.com/ericcurtin/llmman
+cd llmman
+cargo build --release
+```
