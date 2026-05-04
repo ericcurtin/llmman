@@ -504,16 +504,23 @@ async fn spawn_vllm_server(model_dir: &Path, port: u16, model_name: &str) -> any
         .with_context(|| format!("spawn vllm from {}", vllm.display()))
 }
 
-fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
-    if let Ok(out) = std::process::Command::new("which").arg(name).output() {
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() {
-                return Ok(PathBuf::from(p));
-            }
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        // On Windows the executable must carry the .exe suffix.
+        #[cfg(windows)]
+        let candidate = dir.join(format!("{name}.exe"));
+        #[cfg(not(windows))]
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
-    anyhow::bail!("{name} not found on PATH")
+    None
+}
+
+fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
+    find_on_path(name).ok_or_else(|| anyhow::anyhow!("{name} not found on PATH"))
 }
 
 async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
@@ -551,41 +558,12 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 
 async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
     let model_ref = crate::shortnames::resolve(model_ref);
+    // Normalise to the canonical stored reference so that "model" and
+    // "model:latest" always share the same entry in mgr.running.
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
-    // Fast path: model already running.
-    {
-        let mgr = state.0.manager.lock().await;
-        if let Some(m) = mgr.running.get(model_ref) {
-            return Ok(m.port);
-        }
-    } // mutex released before any I/O
-
-    // If the model is not in the local store, pull it now.
-    // This runs outside the mutex since a pull can take minutes.
-    if crate::storage::OciStore::open(&state.0.store_path)
-        .and_then(|s| s.find(model_ref))
-        .is_err()
-    {
-        eprintln!("[llmman] {model_ref} not in store — pulling");
-        let store_path = state.0.store_path.clone();
-        let model_ref_owned = model_ref.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let layout = store_path.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 store path"))?;
-            crate::ffi::pull(&model_ref_owned, layout)
-        })
-        .await
-        .context("pull task panicked")?
-        .context("pull failed")?;
-    }
-
-    // Re-canonicalise after the pull (tag may now be resolvable).
-    let model_ref = canonical_ref(&state.0.store_path, model_ref);
-    let model_ref = model_ref.as_str();
-
     let mut mgr = state.0.manager.lock().await;
-    // Double-check: another request may have started the server while we were pulling.
     if let Some(m) = mgr.running.get(model_ref) {
         return Ok(m.port);
     }
@@ -1269,32 +1247,9 @@ fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 fn resolve_llama_server() -> anyhow::Result<PathBuf> {
-    // Common well-known locations
-    let candidates = [
-        "/usr/local/bin/llama-server",
-        "/usr/bin/llama-server",
-        "/opt/homebrew/bin/llama-server",
-    ];
-    for c in &candidates {
-        if Path::new(c).exists() {
-            return Ok(PathBuf::from(c));
-        }
-    }
-    // Search PATH via `which`
-    if let Ok(out) = std::process::Command::new("which")
-        .arg("llama-server")
-        .output()
-    {
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() {
-                return Ok(PathBuf::from(p));
-            }
-        }
-    }
-    Err(anyhow!(
-        "llama-server not found; install llama.cpp and ensure it is on PATH"
-    ))
+    find_on_path("llama-server").ok_or_else(|| {
+        anyhow!("llama-server not found; install llama.cpp and ensure it is on PATH")
+    })
 }
 
 // ---------------------------------------------------------------------------
