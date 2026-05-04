@@ -25,6 +25,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run a model interactively or with a one-shot prompt
+    Run(cmd::run::RunArgs),
     /// Package model files into a local OCI image
     Build(cmd::build::BuildArgs),
     /// Log in to a container registry
@@ -55,6 +57,7 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
+        Commands::Run(a)     => cmd::run::run(a),
         Commands::Build(a)   => cmd::build::run(a),
         Commands::Login(a)   => cmd::login::run(a),
         Commands::Logout(a)  => cmd::logout::run(a),
