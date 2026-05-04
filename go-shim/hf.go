@@ -415,32 +415,60 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 	}
 
 	return ocispec.Descriptor{
-		MediaType: hfGGUFMediaType,
+		// Use the CNCF model-spec weight media type so the stored manifest is
+		// spec-compliant.  llmman's serve layer detection falls back to checking
+		// the org.cncf.model.filepath annotation for ".gguf", so old manifests
+		// (application/vnd.docker.ai.gguf.v3) still work via the other check.
+		MediaType: "application/vnd.cncf.model.weight.v1.raw",
 		Digest:    dgst,
 		Size:      total,
 		Annotations: map[string]string{
-			ocispec.AnnotationTitle: filepath.Base(file.Path),
+			"org.cncf.model.filepath": filepath.Base(file.Path),
 		},
 	}, nil
 }
 
 // ---------------------------------------------------------------------------
-// storeHFAsOCI — wrap the GGUF blob in a minimal OCI manifest
+// storeHFAsOCI — wrap the GGUF blob in a CNCF model-spec OCI manifest
 // ---------------------------------------------------------------------------
 
+// cncfModelConfig is the required structure for application/vnd.cncf.model.config.v1+json.
+type cncfModelConfig struct {
+	Descriptor struct{} `json:"descriptor"`
+	Config     struct {
+		Format string `json:"format,omitempty"`
+	} `json:"config"`
+	ModelFS struct {
+		Type    string   `json:"type"`
+		DiffIDs []string `json:"diffIds"`
+	} `json:"modelfs"`
+}
+
 func storeHFAsOCI(layoutDir, ref, modelRepo, filename string, ggufDesc ocispec.Descriptor) error {
-	configDesc, err := writeBlob(layoutDir, "application/vnd.oci.image.config.v1+json", []byte("{}"))
+	// Build a conformant CNCF model-spec config blob.
+	var cfg cncfModelConfig
+	cfg.Config.Format = "gguf"
+	cfg.ModelFS.Type = "layers"
+	cfg.ModelFS.DiffIDs = []string{ggufDesc.Digest.String()}
+
+	cfgData, err := json.Marshal(cfg)
 	if err != nil {
-		return fmt.Errorf("write OCI config: %w", err)
+		return fmt.Errorf("marshal CNCF model config: %w", err)
 	}
+	configDesc, err := writeBlob(layoutDir, "application/vnd.cncf.model.config.v1+json", cfgData)
+	if err != nil {
+		return fmt.Errorf("write CNCF model config: %w", err)
+	}
+
 	manifest := ocispec.Manifest{
-		Versioned: specs.Versioned{SchemaVersion: 2},
-		MediaType: ocispec.MediaTypeImageManifest,
-		Config:    configDesc,
-		Layers:    []ocispec.Descriptor{ggufDesc},
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: "application/vnd.cncf.model.manifest.v1+json",
+		Config:       configDesc,
+		Layers:       []ocispec.Descriptor{ggufDesc},
 		Annotations: map[string]string{
-			ocispec.AnnotationTitle: filepath.Base(filename),
-			"ai.model.repo":         modelRepo,
+			"org.cncf.model.filepath": filepath.Base(filename),
+			"ai.model.repo":           modelRepo,
 		},
 	}
 	manifestData, err := json.Marshal(manifest)
