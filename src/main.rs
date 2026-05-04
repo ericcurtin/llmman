@@ -25,6 +25,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Launch an AI coding assistant integration (claude, opencode, codex, …)
+    Launch(cmd::launch::LaunchArgs),
     /// Run a model interactively or with a one-shot prompt
     Run(cmd::run::RunArgs),
     /// Package model files into a local OCI image
@@ -57,6 +59,7 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
+        Commands::Launch(a)  => cmd::launch::run(a),
         Commands::Run(a)     => cmd::run::run(a),
         Commands::Build(a)   => cmd::build::run(a),
         Commands::Login(a)   => cmd::login::run(a),
