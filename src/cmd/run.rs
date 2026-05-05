@@ -233,19 +233,52 @@ fn run_interactive_unix(model: &str) -> anyhow::Result<()> {
     let mut messages: Vec<Msg> = Vec::new();
     let mut rl = Readline::new()?;
     let mut multiline: Option<String> = None; // Some while inside """
+    // paste_sb accumulates lines while rl.pasting — mirrors ollama's `sb` +
+    // `case scanner.Pasting: fmt.Fprintln(&sb, line); continue`
+    let mut paste_sb = String::new();
 
     loop {
-        let prompt = if multiline.is_some() { ". " } else { "> " };
+        let prompt = if multiline.is_some() {
+            ". "
+        } else if !paste_sb.is_empty() {
+            "... " // AltPrompt shown while pasting, mirrors ollama
+        } else {
+            "> "
+        };
+
         let line = match rl.readline(prompt) {
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(unix_readline::ReadlineError::Interrupted) => {
                 multiline = None;
+                paste_sb.clear();
                 continue;
             }
         };
 
-        // Handle """ multiline mode (mirrors ollama interactive.go)
+        // ── Bracketed paste accumulation ────────────────────────────────────
+        // Mirrors `case scanner.Pasting: fmt.Fprintln(&sb, line); continue`
+        // rl.pasting is true while between \x1b[200~ and \x1b[201~.
+        // While pasting, ACCUMULATE into paste_sb WITHOUT submitting.
+        // When pasting ends, the final line falls through to normal handling
+        // with paste_sb prepended — same as ollama's `default: sb.WriteString`.
+        if rl.pasting {
+            paste_sb.push_str(&line);
+            paste_sb.push('\n');
+            continue;
+        }
+
+        // Not pasting: prepend any accumulated paste content to this line.
+        // (ollama: `default: sb.WriteString(line)` then submit if sb.Len()>0)
+        let line = if !paste_sb.is_empty() {
+            let mut full = std::mem::take(&mut paste_sb);
+            full.push_str(&line);
+            full
+        } else {
+            line
+        };
+
+        // ── """ multiline mode ───────────────────────────────────────────────
         if let Some(ref mut buf) = multiline {
             if let Some(content) = line.strip_suffix("\"\"\"") {
                 buf.push_str(content);
@@ -261,7 +294,7 @@ fn run_interactive_unix(model: &str) -> anyhow::Result<()> {
             continue;
         }
 
-        // Slash commands
+        // ── Slash commands ───────────────────────────────────────────────────
         match line.trim() {
             "" => continue,
             "/bye" | "/exit" => break,
@@ -277,7 +310,7 @@ fn run_interactive_unix(model: &str) -> anyhow::Result<()> {
             _ => {}
         }
 
-        // Triple-quote multiline opener
+        // ── Triple-quote multiline opener ────────────────────────────────────
         if line.trim_start().starts_with("\"\"\"") {
             let inner = line.trim_start().trim_start_matches("\"\"\"");
             if let Some(closed) = inner.strip_suffix("\"\"\"") {
@@ -379,14 +412,22 @@ mod unix_readline {
         Interrupted,
     }
 
+    // CharBracketedPaste = 50 ('2') — third byte of ESC[ sequence;
+    // reading 3 more bytes gives "00~" (paste start) or "01~" (paste end).
+    // Mirrors ollama readline/types.go: CharBracketedPaste/Start/End.
+    const CHAR_BRACKETED_PASTE: u8 = 50;   // '2'
+    const PASTE_START: &[u8; 3] = b"00~";
+    const PASTE_END:   &[u8; 3] = b"01~";
+
     pub struct Readline {
         reader: BufReader<Stdin>,
         orig: libc::termios,
         fd: std::os::unix::io::RawFd,
+        pub pasting: bool, // true while inside \x1b[200~...\x1b[201~
     }
 
     impl Readline {
-        /// Enable raw mode (mirrors ollama SetRawMode in readline/term.go).
+        /// Enable raw mode + bracketed paste (mirrors ollama SetRawMode + StartBracketedPaste).
         pub fn new() -> anyhow::Result<Self> {
             let stdin = std::io::stdin();
             let fd = stdin.as_raw_fd();
@@ -401,27 +442,25 @@ mod unix_readline {
 
             let mut raw = orig;
             unsafe {
-                // Exact mirror of ollama SetRawMode:
-                // newTermios.Iflag &^= IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON
                 raw.c_iflag &= !(libc::IGNBRK | libc::BRKINT | libc::PARMRK
                     | libc::ISTRIP | libc::INLCR | libc::IGNCR
                     | libc::ICRNL  | libc::IXON);
-                // newTermios.Lflag &^= ECHO|ECHONL|ICANON|ISIG|IEXTEN
                 raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON
                     | libc::ISIG | libc::IEXTEN);
-                // newTermios.Cflag &^= CSIZE|PARENB; newTermios.Cflag |= CS8
                 raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
                 raw.c_cflag |= libc::CS8;
-                // cc[VMIN]=1, cc[VTIME]=0
                 raw.c_cc[libc::VMIN as usize]  = 1;
                 raw.c_cc[libc::VTIME as usize] = 0;
-
                 if libc::tcsetattr(fd, libc::TCSANOW, &raw) < 0 {
                     anyhow::bail!("tcsetattr failed");
                 }
             }
 
-            Ok(Self { reader: BufReader::new(stdin), orig, fd })
+            // Enable bracketed paste mode — mirrors `fmt.Print(readline.StartBracketedPaste)`
+            print!("\x1b[?2004h");
+            std::io::stdout().flush().ok();
+
+            Ok(Self { reader: BufReader::new(stdin), orig, fd, pasting: false })
         }
 
         /// Read one logical line from the terminal.
@@ -465,10 +504,34 @@ mod unix_readline {
                     stop_draining = true;
                 }
 
-                // ESC sequence handling (arrow keys etc.)
+                // ESC sequence handling — mirrors ollama readline.go escex block.
+                // Key addition: CharBracketedPaste ('2') reads 3 more bytes to
+                // detect "00~" (paste start) or "01~" (paste end).
                 if esc_ex {
                     esc_ex = false;
-                    // Skip arrow keys / delete for now
+                    match r {
+                        CHAR_BRACKETED_PASTE => {
+                            // Read 3 more bytes: "00~" or "01~"
+                            let mut code = [0u8; 3];
+                            if self.reader.read_exact(&mut code).is_ok() {
+                                if &code == PASTE_START {
+                                    self.pasting = true;
+                                } else if &code == PASTE_END {
+                                    self.pasting = false;
+                                }
+                                // Update draining after reading extra bytes
+                                if !self.reader.buffer().is_empty() {
+                                    draining = true;
+                                }
+                            }
+                        }
+                        // Consume the '~' for delete/other 2-byte sequences
+                        51 | 53 | 54 => {
+                            let mut tilde = [0u8; 1];
+                            let _ = self.reader.read_exact(&mut tilde);
+                        }
+                        _ => {} // arrow keys etc. — just skip
+                    }
                     continue;
                 } else if esc {
                     esc = false;
@@ -556,6 +619,9 @@ mod unix_readline {
 
     impl Drop for Readline {
         fn drop(&mut self) {
+            // Disable bracketed paste, restore terminal — mirrors ollama's defer
+            print!("\x1b[?2004l");
+            std::io::stdout().flush().ok();
             unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig); }
         }
     }
