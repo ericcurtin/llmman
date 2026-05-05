@@ -955,6 +955,7 @@ dependencies = [
  "sha2",
  "tar",
  "tokio",
+ "tokio-util",
  "toml",
  "walkdir",
 ]

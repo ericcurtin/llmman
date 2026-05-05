@@ -8,6 +8,7 @@ use std::io::{self, IsTerminal, Write};
 use anyhow::Context;
 use clap::Args;
 
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
@@ -152,16 +153,27 @@ struct GenChunk {
 }
 
 // ---------------------------------------------------------------------------
-// SSE line buffering
+// Streaming NDJSON reader
 // ---------------------------------------------------------------------------
 
-/// Collect the full response body and split into lines.
-async fn collect_lines(resp: reqwest::Response) -> anyhow::Result<Vec<String>> {
-    let raw = resp.bytes().await.context("read response")?;
-    Ok(String::from_utf8_lossy(&raw)
-        .lines()
-        .map(|l| l.to_string())
-        .collect())
+/// Yield complete newline-terminated lines from an HTTP response as they
+/// arrive, buffering incomplete lines across TCP chunks.
+async fn stream_lines(
+    resp: reqwest::Response,
+    mut f: impl FnMut(&str),
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    use tokio_util::io::StreamReader;
+
+    let body = resp
+        .bytes_stream()
+        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let reader = StreamReader::new(body);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        f(&line);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -185,11 +197,10 @@ async fn run_oneshot(client: &Client, model: &str, prompt: &str) -> anyhow::Resu
     }
 
     let mut thinking_open = false;
+    let mut done = false;
 
-    for line in collect_lines(resp).await? {
-        let Ok(chunk) = serde_json::from_str::<GenChunk>(&line) else {
-            continue;
-        };
+    stream_lines(resp, |line| {
+        let Ok(chunk) = serde_json::from_str::<GenChunk>(line) else { return };
         if let Some(ref t) = chunk.thinking {
             if !t.is_empty() {
                 if !thinking_open {
@@ -207,10 +218,8 @@ async fn run_oneshot(client: &Client, model: &str, prompt: &str) -> anyhow::Resu
             print!("{}", chunk.response);
             io::stdout().flush().ok();
         }
-        if chunk.done {
-            break;
-        }
-    }
+        if chunk.done { done = true; }
+    }).await?;
 
     println!("\n");
     Ok(())
@@ -291,10 +300,8 @@ async fn chat_turn(client: &Client, model: &str, messages: &[Msg]) -> anyhow::Re
     let mut content = String::new();
     let mut thinking_open = false;
 
-    for line in collect_lines(resp).await? {
-        let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else {
-            continue;
-        };
+    stream_lines(resp, |line| {
+        let Ok(chunk) = serde_json::from_str::<ChatChunk>(line) else { return };
         if let Some(ref msg) = chunk.message {
             if let Some(ref t) = msg.thinking {
                 if !t.is_empty() {
@@ -315,10 +322,7 @@ async fn chat_turn(client: &Client, model: &str, messages: &[Msg]) -> anyhow::Re
                 content.push_str(&msg.content);
             }
         }
-        if chunk.done {
-            break;
-        }
-    }
+    }).await?;
 
     Ok(content)
 }
