@@ -234,22 +234,22 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin);
 
+    eprintln!("Type a message, /bye to exit, or \"\"\" for multiline input.");
+
     loop {
-        // Prompt
         print!(">>> ");
         io::stdout().flush().ok();
 
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            // EOF (Ctrl-D)
             println!();
             break;
         }
-        let line = line.trim().to_string();
+        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
 
-        // Slash commands
-        match line.as_str() {
+        // Slash commands (checked before multiline so /bye always works)
+        match line.trim() {
             "" => continue,
             "/bye" | "/exit" => break,
             "/clear" => {
@@ -257,14 +257,46 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
                 eprintln!("Conversation cleared.");
                 continue;
             }
-            _ if line.starts_with('/') => {
-                eprintln!("Commands: /bye  /clear");
+            _ if line.trim().starts_with('/') => {
+                eprintln!("Commands: /bye  /clear  \"\"\" (multiline)");
                 continue;
             }
             _ => {}
         }
 
-        messages.push(Msg { role: "user".into(), content: line, thinking: None });
+        // Multiline mode: """ starts and ends a block, matching ollama's interactive.go
+        let content = if line.trim_start().starts_with("\"\"\"") {
+            let first = line.trim_start().trim_start_matches("\"\"\"");
+            // Check for same-line close: """text"""
+            if let Some(inner) = first.strip_suffix("\"\"\"") {
+                inner.to_string()
+            } else {
+                // Open block — keep reading until closing """
+                let mut buf = first.to_string();
+                buf.push('\n');
+                loop {
+                    print!("... ");
+                    io::stdout().flush().ok();
+                    let mut more = String::new();
+                    let m = reader.read_line(&mut more).await?;
+                    if m == 0 { break; }
+                    let more = more.trim_end_matches('\n').trim_end_matches('\r');
+                    if let Some(before) = more.strip_suffix("\"\"\"") {
+                        buf.push_str(before);
+                        break;
+                    }
+                    buf.push_str(more);
+                    buf.push('\n');
+                }
+                buf.trim_end_matches('\n').to_string()
+            }
+        } else {
+            line
+        };
+
+        if content.trim().is_empty() { continue; }
+
+        messages.push(Msg { role: "user".into(), content, thinking: None });
 
         let assistant_content = chat_turn(client, model, &messages).await?;
         messages.push(Msg {
