@@ -217,6 +217,15 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	layoutDir := C.GoString(cLayoutDir)
 	ctx := context.Background()
 
+	// URI-scheme dispatch: hf://, ms://, ngc://, s3://, gs://, /absolute/path.
+	// These bypass the OCI registry probe and HF host detection below.
+	if handled, err := dispatchPull(ctx, ref, layoutDir); handled {
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp("")
+	}
+
 	// Normalize: append :latest if reference has no tag or digest
 	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
 		ref = ref + ":latest"
