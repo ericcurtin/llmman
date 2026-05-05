@@ -1,13 +1,25 @@
 //! `llmman run` — interactive chat or one-shot prompt.
 //!
-//! Mirrors `ollama run`: interactive mode uses POST /api/chat with the full
-//! message history; one-shot mode uses POST /api/generate.
+//! Interactive mode uses a raw-mode readline ported directly from ollama's
+//! readline package (readline/readline.go, readline/term.go).  The key
+//! mechanism for paste detection mirrors ollama exactly:
+//!
+//!   // ollama (Go)
+//!   if i.Terminal.reader.Buffered() > 0 { draining = true }
+//!
+//!   // llmman (Rust)
+//!   if !reader.buffer().is_empty() { draining = true; }
+//!
+//! When the user pastes, the terminal sends all characters to the PTY buffer
+//! at once.  BufReader fills its internal buffer in one syscall.  After
+//! read()ing one byte, buffer() is non-empty ↔ we are draining a paste.
+//! While draining, a '\n' (CharCtrlJ) submits the line like Enter does
+//! (same as ollama).  When not draining, '\n' is Ctrl-J multiline.
 
 use std::io::{self, IsTerminal, Write};
 
 use anyhow::Context;
 use clap::Args;
-
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -22,46 +34,35 @@ const SERVER: &str = "http://127.0.0.1:17434";
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Model to run (short name or full reference)
     #[arg(value_name = "MODEL")]
     pub model: String,
-
-    /// Prompt for one-shot mode; omit for interactive chat
     #[arg(value_name = "PROMPT", trailing_var_arg = true, allow_hyphen_values = true)]
     pub prompt: Vec<String>,
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
-    tokio::runtime::Runtime::new()?.block_on(run_async(args))
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-async fn run_async(args: &RunArgs) -> anyhow::Result<()> {
     let model = crate::shortnames::resolve(&args.model);
-    let client = Client::new();
-
-    ensure_server(&client, &model).await?;
-
     let prompt = args.prompt.join(" ");
+
+    // Ensure serve is running before anything else.
+    let rt = tokio::runtime::Runtime::new()?;
+    let async_client = Client::new();
+    rt.block_on(ensure_server(&async_client, &model))?;
+
     let interactive = prompt.is_empty() && io::stdin().is_terminal();
 
     if interactive {
-        run_interactive(&client, &model).await
+        run_interactive_tty(&model)
     } else {
-        // One-shot: use the CLI prompt or read a single line from piped stdin.
         let p = if prompt.is_empty() {
-            let mut line = String::new();
-            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-            reader.read_line(&mut line).await?;
-            line.trim().to_string()
+            let mut s = String::new();
+            io::stdin().read_line(&mut s)?;
+            s.trim().to_string()
         } else {
             prompt
         };
         if !p.is_empty() {
-            run_oneshot(&client, &model, &p).await?;
+            rt.block_on(run_oneshot(&async_client, &model, &p))?;
         }
         Ok(())
     }
@@ -80,22 +81,18 @@ async fn server_alive(client: &Client) -> bool {
         .is_ok()
 }
 
-/// Ensure llmman serve is running; start it in the background if not.
 async fn ensure_server(client: &Client, model: &str) -> anyhow::Result<()> {
     if server_alive(client).await {
         return Ok(());
     }
-
     let exe = std::env::current_exe().context("could not resolve own executable")?;
     eprintln!("[llmman] starting serve...");
     tokio::process::Command::new(&exe)
         .arg("serve")
         .arg(model)
-        .kill_on_drop(false) // keep running after llmman run exits
+        .kill_on_drop(false)
         .spawn()
         .context("spawn llmman serve")?;
-
-    // Wait up to 60 s for the server to become ready.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if Instant::now() > deadline {
@@ -109,7 +106,7 @@ async fn ensure_server(client: &Client, model: &str) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Wire types
+// Wire types (shared between async one-shot and sync interactive)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,52 +150,20 @@ struct GenChunk {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming NDJSON reader
-// ---------------------------------------------------------------------------
-
-/// Yield complete newline-terminated lines from an HTTP response as they
-/// arrive, buffering incomplete lines across TCP chunks.
-async fn stream_lines(
-    resp: reqwest::Response,
-    mut f: impl FnMut(&str),
-) -> anyhow::Result<()> {
-    use tokio::io::AsyncBufReadExt;
-    use tokio_util::io::StreamReader;
-
-    let body = resp
-        .bytes_stream()
-        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-    let reader = StreamReader::new(body);
-    let mut lines = tokio::io::BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        f(&line);
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// One-shot: POST /api/generate
+// One-shot (async streaming)
 // ---------------------------------------------------------------------------
 
 async fn run_oneshot(client: &Client, model: &str, prompt: &str) -> anyhow::Result<()> {
-    let url = format!("{SERVER}/api/generate");
-    let body = GenReq { model, prompt, stream: true };
-
     let resp = client
-        .post(&url)
-        .json(&body)
+        .post(&format!("{SERVER}/api/generate"))
+        .json(&GenReq { model, prompt, stream: true })
         .send()
         .await
         .context("connect to llmman serve")?;
-
     if !resp.status().is_success() {
-        let e = resp.text().await.unwrap_or_default();
-        anyhow::bail!("{e}");
+        anyhow::bail!("{}", resp.text().await.unwrap_or_default());
     }
-
     let mut thinking_open = false;
-    let mut done = false;
-
     stream_lines(resp, |line| {
         let Ok(chunk) = serde_json::from_str::<GenChunk>(line) else { return };
         if let Some(ref t) = chunk.thinking {
@@ -218,61 +183,86 @@ async fn run_oneshot(client: &Client, model: &str, prompt: &str) -> anyhow::Resu
             print!("{}", chunk.response);
             io::stdout().flush().ok();
         }
-        if chunk.done { done = true; }
-    }).await?;
-
+    })
+    .await?;
     println!("\n");
     Ok(())
 }
 
+async fn stream_lines(
+    resp: reqwest::Response,
+    mut f: impl FnMut(&str),
+) -> anyhow::Result<()> {
+    use tokio_util::io::StreamReader;
+    let body = resp
+        .bytes_stream()
+        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let reader = StreamReader::new(body);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        f(&line);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Interactive: POST /api/chat with full message history
+// Interactive — TTY path
 // ---------------------------------------------------------------------------
 
-async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
+fn run_interactive_tty(model: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        run_interactive_unix(model)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows fallback: basic cooked-mode loop
+        run_interactive_cooked(model)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive — Unix raw-mode readline (ported from ollama readline package)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn run_interactive_unix(model: &str) -> anyhow::Result<()> {
+    use unix_readline::Readline;
+
+    let client = reqwest::blocking::Client::new();
     let mut messages: Vec<Msg> = Vec::new();
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
-
-    eprintln!("Type a message, /bye to exit, or \"\"\" for multiline input.");
+    let mut rl = Readline::new()?;
+    let mut multiline: Option<String> = None; // Some while inside """
 
     loop {
-        print!("> ");
-        io::stdout().flush().ok();
-
-        // Read one line (blocks until Enter or EOF).
-        let mut raw = String::new();
-        let n = reader.read_line(&mut raw).await?;
-        if n == 0 {
-            println!();
-            break;
-        }
-        let first = strip_paste_markers(raw.trim_end_matches('\n').trim_end_matches('\r'));
-
-        // ── Paste detection ────────────────────────────────────────────────────
-        // Mirrors ollama readline's `Buffered() > 0` check:
-        // when the user pastes, ALL lines land in the kernel TTY buffer at once.
-        // The BufReader reads everything available in one syscall, so after
-        // read_line() returns the first line, reader.buffer() already contains
-        // the rest of the pasted content.  Keep draining it immediately.
-        let content = if !reader.buffer().is_empty() {
-            let mut buf = first;
-            while !reader.buffer().is_empty() {
-                let mut more = String::new();
-                if reader.read_line(&mut more).await? == 0 { break; }
-                let more = strip_paste_markers(more.trim_end_matches('\n').trim_end_matches('\r'));
-                if !more.is_empty() {
-                    buf.push('\n');
-                    buf.push_str(&more);
-                }
+        let prompt = if multiline.is_some() { ". " } else { "> " };
+        let line = match rl.readline(prompt) {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(unix_readline::ReadlineError::Interrupted) => {
+                multiline = None;
+                continue;
             }
-            buf
-        } else {
-            first
         };
 
-        // ── Slash commands ────────────────────────────────────────────────────
-        match content.trim() {
+        // Handle """ multiline mode (mirrors ollama interactive.go)
+        if let Some(ref mut buf) = multiline {
+            if let Some(content) = line.strip_suffix("\"\"\"") {
+                buf.push_str(content);
+                let full = std::mem::take(buf).trim_end_matches('\n').to_string();
+                multiline = None;
+                if !full.trim().is_empty() {
+                    chat_submit(&client, model, &mut messages, full)?;
+                }
+            } else {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            continue;
+        }
+
+        // Slash commands
+        match line.trim() {
             "" => continue,
             "/bye" | "/exit" => break,
             "/clear" => {
@@ -280,88 +270,66 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
                 eprintln!("Conversation cleared.");
                 continue;
             }
-            _ if content.trim().starts_with('/') => {
+            s if s.starts_with('/') => {
                 eprintln!("Commands: /bye  /clear  \"\"\" (multiline)");
                 continue;
             }
             _ => {}
         }
 
-        // ── Triple-quote multiline (typed, not pasted) ────────────────────────
-        let content = if content.trim_start().starts_with("\"\"\"") {
-            let first_inner = content.trim_start().trim_start_matches("\"\"\"");
-            if let Some(inner) = first_inner.strip_suffix("\"\"\"") {
-                inner.to_string()
-            } else {
-                let mut buf = first_inner.to_string();
-                buf.push('\n');
-                loop {
-                    print!(". ");
-                    io::stdout().flush().ok();
-                    let mut more = String::new();
-                    let m = reader.read_line(&mut more).await?;
-                    if m == 0 { break; }
-                    let more = more.trim_end_matches('\n').trim_end_matches('\r');
-                    if let Some(before) = more.strip_suffix("\"\"\"") {
-                        buf.push_str(before);
-                        break;
-                    }
-                    buf.push_str(more);
-                    buf.push('\n');
+        // Triple-quote multiline opener
+        if line.trim_start().starts_with("\"\"\"") {
+            let inner = line.trim_start().trim_start_matches("\"\"\"");
+            if let Some(closed) = inner.strip_suffix("\"\"\"") {
+                let content = closed.to_string();
+                if !content.trim().is_empty() {
+                    chat_submit(&client, model, &mut messages, content)?;
                 }
-                buf.trim_end_matches('\n').to_string()
+            } else {
+                multiline = Some(inner.to_string() + "\n");
             }
-        } else {
-            content
-        };
+            continue;
+        }
 
-        if content.trim().is_empty() { continue; }
-
-        messages.push(Msg { role: "user".into(), content, thinking: None });
-
-        let assistant_content = chat_turn(client, model, &messages).await?;
-        messages.push(Msg {
-            role: "assistant".into(),
-            content: assistant_content,
-            thinking: None,
-        });
-
-        println!("\n");
+        if !line.trim().is_empty() {
+            chat_submit(&client, model, &mut messages, line)?;
+        }
     }
 
     Ok(())
 }
 
-/// Strip bracketed-paste escape markers that some terminals inject inline.
-fn strip_paste_markers(s: &str) -> String {
-    s.trim_start_matches("\x1b[200~")
-     .trim_end_matches("\x1b[201~")
-     .to_string()
-}
-
-/// Send one chat turn and stream the response to stdout.
-/// Returns the full assembled assistant content.
-async fn chat_turn(client: &Client, model: &str, messages: &[Msg]) -> anyhow::Result<String> {
-    let url = format!("{SERVER}/api/chat");
-    let body = ChatReq { model, messages, stream: true };
+/// Send one chat turn using the blocking reqwest client and stream the response.
+#[cfg(unix)]
+fn chat_submit(
+    client: &reqwest::blocking::Client,
+    model: &str,
+    messages: &mut Vec<Msg>,
+    content: String,
+) -> anyhow::Result<()> {
+    messages.push(Msg { role: "user".into(), content, thinking: None });
 
     let resp = client
-        .post(&url)
-        .json(&body)
+        .post(&format!("{SERVER}/api/chat"))
+        .json(&ChatReq { model, messages, stream: true })
         .send()
-        .await
         .context("connect to llmman serve")?;
 
     if !resp.status().is_success() {
-        let e = resp.text().await.unwrap_or_default();
+        let e = resp.text().unwrap_or_default();
         anyhow::bail!("{e}");
     }
 
-    let mut content = String::new();
+    // Stream NDJSON lines from the response body.
+    // reqwest::blocking::Response implements Read, so BufReader gives us lines
+    // as they arrive — each line appears when the next token is generated.
+    use std::io::BufRead;
+    let mut full = String::new();
     let mut thinking_open = false;
-
-    stream_lines(resp, |line| {
-        let Ok(chunk) = serde_json::from_str::<ChatChunk>(line) else { return };
+    for line in std::io::BufReader::new(resp).lines() {
+        let line = line?;
+        if line.is_empty() { continue; }
+        let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else { continue };
         if let Some(ref msg) = chunk.message {
             if let Some(ref t) = msg.thinking {
                 if !t.is_empty() {
@@ -379,10 +347,282 @@ async fn chat_turn(client: &Client, model: &str, messages: &[Msg]) -> anyhow::Re
             if !msg.content.is_empty() {
                 print!("{}", msg.content);
                 io::stdout().flush().ok();
-                content.push_str(&msg.content);
+                full.push_str(&msg.content);
             }
         }
-    }).await?;
+        if chunk.done { break; }
+    }
+    println!("\n");
+    messages.push(Msg { role: "assistant".into(), content: full, thinking: None });
+    Ok(())
+}
 
-    Ok(content)
+// ---------------------------------------------------------------------------
+// Unix raw-mode readline — direct port of ollama readline/readline.go
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod unix_readline {
+    use std::io::{BufRead, BufReader, Read, Stdin, Write};
+    use std::os::unix::io::AsRawFd;
+
+    // Character codes — identical to ollama readline/types.go
+    const CHAR_INTERRUPT: u8 = 3;  // Ctrl-C
+    const CHAR_EOF: u8 = 4;        // Ctrl-D
+    const CHAR_CTRL_J: u8 = 10;    // \n  line feed / pasted newline
+    const CHAR_ENTER: u8 = 13;     // \r  keyboard Enter
+    const CHAR_ESC: u8 = 27;
+    const CHAR_ESCAPE_EX: u8 = 91; // '[' — second byte of ESC[
+    const CHAR_BACKSPACE: u8 = 127;
+
+    pub enum ReadlineError {
+        Interrupted,
+    }
+
+    pub struct Readline {
+        reader: BufReader<Stdin>,
+        orig: libc::termios,
+        fd: std::os::unix::io::RawFd,
+    }
+
+    impl Readline {
+        /// Enable raw mode (mirrors ollama SetRawMode in readline/term.go).
+        pub fn new() -> anyhow::Result<Self> {
+            let stdin = std::io::stdin();
+            let fd = stdin.as_raw_fd();
+
+            let orig = unsafe {
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut t) < 0 {
+                    anyhow::bail!("tcgetattr failed");
+                }
+                t
+            };
+
+            let mut raw = orig;
+            unsafe {
+                // Exact mirror of ollama SetRawMode:
+                // newTermios.Iflag &^= IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON
+                raw.c_iflag &= !(libc::IGNBRK | libc::BRKINT | libc::PARMRK
+                    | libc::ISTRIP | libc::INLCR | libc::IGNCR
+                    | libc::ICRNL  | libc::IXON);
+                // newTermios.Lflag &^= ECHO|ECHONL|ICANON|ISIG|IEXTEN
+                raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON
+                    | libc::ISIG | libc::IEXTEN);
+                // newTermios.Cflag &^= CSIZE|PARENB; newTermios.Cflag |= CS8
+                raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
+                raw.c_cflag |= libc::CS8;
+                // cc[VMIN]=1, cc[VTIME]=0
+                raw.c_cc[libc::VMIN as usize]  = 1;
+                raw.c_cc[libc::VTIME as usize] = 0;
+
+                if libc::tcsetattr(fd, libc::TCSANOW, &raw) < 0 {
+                    anyhow::bail!("tcsetattr failed");
+                }
+            }
+
+            Ok(Self { reader: BufReader::new(stdin), orig, fd })
+        }
+
+        /// Read one logical line from the terminal.
+        ///
+        /// Paste detection mirrors ollama readline/readline.go exactly:
+        ///   - After each read, check reader.buffer() (≡ reader.Buffered() in Go)
+        ///   - If non-empty → draining (we are consuming a paste)
+        ///   - CharCtrlJ (\n) while draining → submit (same as Enter)
+        ///   - CharCtrlJ while NOT draining → Ctrl-J multiline continuation
+        ///   - CharEnter (\r) → always submit
+        pub fn readline(&mut self, prompt: &str) -> Result<Option<String>, ReadlineError> {
+            print!("{prompt}");
+            std::io::stdout().flush().ok();
+
+            let mut buf: Vec<u8> = Vec::new();
+            let mut pasted_lines: Vec<String> = Vec::new();
+            let mut draining = false;
+            let mut stop_draining = false;
+            let mut esc = false;
+            let mut esc_ex = false;
+
+            loop {
+                // Apply deferred state from previous iteration (ollama lines 130-134)
+                if stop_draining {
+                    draining = false;
+                    stop_draining = false;
+                }
+
+                // Read exactly one byte
+                let mut b = [0u8; 1];
+                match self.reader.read_exact(&mut b) {
+                    Ok(_) => {}
+                    Err(_) => return Ok(None),
+                }
+                let r = b[0];
+
+                // Paste detection: mirrors `if i.Terminal.reader.Buffered() > 0`
+                if !self.reader.buffer().is_empty() {
+                    draining = true;
+                } else if draining {
+                    stop_draining = true;
+                }
+
+                // ESC sequence handling (arrow keys etc.)
+                if esc_ex {
+                    esc_ex = false;
+                    // Skip arrow keys / delete for now
+                    continue;
+                } else if esc {
+                    esc = false;
+                    if r == CHAR_ESCAPE_EX { esc_ex = true; }
+                    continue;
+                }
+
+                match r {
+                    CHAR_INTERRUPT => {
+                        pasted_lines.clear();
+                        buf.clear();
+                        println!();
+                        return Err(ReadlineError::Interrupted);
+                    }
+                    CHAR_EOF => {
+                        if buf.is_empty() && pasted_lines.is_empty() {
+                            println!();
+                            return Ok(None);
+                        }
+                    }
+                    CHAR_ESC => { esc = true; }
+                    CHAR_BACKSPACE => {
+                        if !buf.is_empty() {
+                            // Remove last complete UTF-8 codepoint
+                            loop {
+                                match buf.pop() {
+                                    None => break,
+                                    Some(b) if (b & 0xC0) != 0x80 => break, // lead byte
+                                    Some(_) => {} // continuation byte, keep going
+                                }
+                            }
+                            print!("\x08 \x08");
+                            std::io::stdout().flush().ok();
+                        } else if !pasted_lines.is_empty() {
+                            let prev = pasted_lines.pop().unwrap();
+                            print!("\r\x1b[K\x1b[A\r\x1b[K{prompt}{prev}");
+                            std::io::stdout().flush().ok();
+                            buf = prev.into_bytes();
+                        }
+                    }
+                    CHAR_CTRL_J => {
+                        // \n: pasted newline (draining) or Ctrl-J multiline (not draining)
+                        // Mirrors ollama case CharCtrlJ
+                        if !draining {
+                            // Not draining → multiline continuation (Ctrl-J typed)
+                            pasted_lines.push(String::from_utf8_lossy(&buf).to_string());
+                            buf.clear();
+                            println!();
+                            print!("... ");
+                            std::io::stdout().flush().ok();
+                        } else {
+                            // Draining → submit (pasted \n acts like Enter)
+                            return Ok(Some(Self::assemble(&mut buf, &mut pasted_lines)));
+                        }
+                    }
+                    CHAR_ENTER => {
+                        // \r: keyboard Enter → always submit
+                        return Ok(Some(Self::assemble(&mut buf, &mut pasted_lines)));
+                    }
+                    c => {
+                        // Printable ASCII, tab, or UTF-8 bytes
+                        if c >= 32 || c == 9 || c >= 0x80 {
+                            buf.push(c);
+                            let _ = std::io::stdout().write_all(&[c]);
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                }
+            }
+        }
+
+        fn assemble(buf: &mut Vec<u8>, pasted_lines: &mut Vec<String>) -> String {
+            let last = String::from_utf8_lossy(buf).to_string();
+            buf.clear();
+            println!();
+            if pasted_lines.is_empty() {
+                last
+            } else {
+                let prefix = pasted_lines.join("\n");
+                pasted_lines.clear();
+                format!("{prefix}\n{last}")
+            }
+        }
+    }
+
+    impl Drop for Readline {
+        fn drop(&mut self) {
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig); }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows / non-TTY fallback (cooked mode)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn run_interactive_cooked(model: &str) -> anyhow::Result<()> {
+    let client = reqwest::blocking::Client::new();
+    let mut messages: Vec<Msg> = Vec::new();
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut reader = std::io::BufReader::new(stdin.lock());
+
+    loop {
+        print!("> ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 { break; }
+        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        match line.trim() {
+            "" => continue,
+            "/bye" | "/exit" => break,
+            "/clear" => { messages.clear(); continue; }
+            _ => {}
+        }
+        if !line.trim().is_empty() {
+            #[cfg(unix)]
+            chat_submit(&client, model, &mut messages, line)?;
+            #[cfg(not(unix))]
+            chat_submit_win(&client, model, &mut messages, line)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chat_submit_win(
+    client: &reqwest::blocking::Client,
+    model: &str,
+    messages: &mut Vec<Msg>,
+    content: String,
+) -> anyhow::Result<()> {
+    messages.push(Msg { role: "user".into(), content, thinking: None });
+    let resp = client
+        .post(&format!("{SERVER}/api/chat"))
+        .json(&ChatReq { model, messages, stream: true })
+        .send()?;
+    use std::io::BufRead;
+    let mut full = String::new();
+    for line in std::io::BufReader::new(resp).lines() {
+        let line = line?;
+        if line.is_empty() { continue; }
+        let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else { continue };
+        if let Some(ref msg) = chunk.message {
+            if !msg.content.is_empty() {
+                print!("{}", msg.content);
+                io::stdout().flush().ok();
+                full.push_str(&msg.content);
+            }
+        }
+        if chunk.done { break; }
+    }
+    println!("\n");
+    messages.push(Msg { role: "assistant".into(), content: full, thinking: None });
+    Ok(())
 }
