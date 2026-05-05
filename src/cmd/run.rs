@@ -241,7 +241,7 @@ fn run_interactive_unix(model: &str) -> anyhow::Result<()> {
         let prompt = if multiline.is_some() {
             ". "
         } else if !paste_sb.is_empty() {
-            "... " // AltPrompt shown while pasting, mirrors ollama
+            ". " // AltPrompt shown while pasting, mirrors ollama
         } else {
             "> "
         };
