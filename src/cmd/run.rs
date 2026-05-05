@@ -580,7 +580,7 @@ mod unix_readline {
                             pasted_lines.push(String::from_utf8_lossy(&buf).to_string());
                             buf.clear();
                             println!();
-                            print!("... ");
+                            print!(". ");
                             std::io::stdout().flush().ok();
                         } else {
                             // Draining → submit (pasted \n acts like Enter)
