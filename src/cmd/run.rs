@@ -234,80 +234,45 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin);
 
-    // Enable bracketed paste mode (mirrors ollama interactive.go).
-    // The terminal wraps pasted text with \x1b[200~...\x1b[201~, letting us
-    // detect paste and buffer lines instead of submitting each one separately.
-    print!("\x1b[?2004h");
-    io::stdout().flush().ok();
-
-    // paste_buf: Some(accumulated) while inside a bracketed paste block.
-    let mut paste_buf: Option<String> = None;
-
     eprintln!("Type a message, /bye to exit, or \"\"\" for multiline input.");
 
     loop {
-        if paste_buf.is_none() {
-            print!("> ");
-            io::stdout().flush().ok();
-        }
+        print!("> ");
+        io::stdout().flush().ok();
 
+        // Read one line (blocks until Enter or EOF).
         let mut raw = String::new();
         let n = reader.read_line(&mut raw).await?;
         if n == 0 {
             println!();
             break;
         }
-        let raw = raw.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        let first = strip_paste_markers(raw.trim_end_matches('\n').trim_end_matches('\r'));
 
-        // ── Bracketed paste handling ──────────────────────────────────────────
-        // A pasted block starts with \x1b[200~ and ends with \x1b[201~.
-        // While inside a paste we buffer every line; when the end marker
-        // arrives we submit the whole block as one message.
-        if let Some(ref mut buf) = paste_buf {
-            // Still inside a paste — check for end marker.
-            if let Some(content) = raw.strip_suffix("\x1b[201~") {
-                if !content.is_empty() {
-                    buf.push_str(content);
+        // ── Paste detection ────────────────────────────────────────────────────
+        // Mirrors ollama readline's `Buffered() > 0` check:
+        // when the user pastes, ALL lines land in the kernel TTY buffer at once.
+        // The BufReader reads everything available in one syscall, so after
+        // read_line() returns the first line, reader.buffer() already contains
+        // the rest of the pasted content.  Keep draining it immediately.
+        let content = if !reader.buffer().is_empty() {
+            let mut buf = first;
+            while !reader.buffer().is_empty() {
+                let mut more = String::new();
+                if reader.read_line(&mut more).await? == 0 { break; }
+                let more = strip_paste_markers(more.trim_end_matches('\n').trim_end_matches('\r'));
+                if !more.is_empty() {
+                    buf.push('\n');
+                    buf.push_str(&more);
                 }
-                let full = buf.trim_end_matches('\n').to_string();
-                paste_buf = None;
-                if full.trim().is_empty() { continue; }
-                messages.push(Msg { role: "user".into(), content: full, thinking: None });
-                let reply = chat_turn(client, model, &messages).await?;
-                messages.push(Msg { role: "assistant".into(), content: reply, thinking: None });
-                println!("\n");
-                continue;
             }
-            buf.push_str(&raw);
-            buf.push('\n');
-            continue;
-        }
-
-        if raw.starts_with("\x1b[200~") {
-            // Paste start — strip marker, check if it also ends on this line.
-            let after = raw.trim_start_matches("\x1b[200~");
-            if let Some(inner) = after.strip_suffix("\x1b[201~") {
-                // Entire paste on one line.
-                let content = inner.trim().to_string();
-                if !content.is_empty() {
-                    messages.push(Msg { role: "user".into(), content, thinking: None });
-                    let reply = chat_turn(client, model, &messages).await?;
-                    messages.push(Msg { role: "assistant".into(), content: reply, thinking: None });
-                    println!("\n");
-                }
-            } else {
-                // Multi-line paste — start buffering.
-                let mut buf = after.to_string();
-                buf.push('\n');
-                paste_buf = Some(buf);
-            }
-            continue;
-        }
-
-        let line = raw;
+            buf
+        } else {
+            first
+        };
 
         // ── Slash commands ────────────────────────────────────────────────────
-        match line.trim() {
+        match content.trim() {
             "" => continue,
             "/bye" | "/exit" => break,
             "/clear" => {
@@ -315,7 +280,7 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
                 eprintln!("Conversation cleared.");
                 continue;
             }
-            _ if line.trim().starts_with('/') => {
+            _ if content.trim().starts_with('/') => {
                 eprintln!("Commands: /bye  /clear  \"\"\" (multiline)");
                 continue;
             }
@@ -323,12 +288,12 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
         }
 
         // ── Triple-quote multiline (typed, not pasted) ────────────────────────
-        let content = if line.trim_start().starts_with("\"\"\"") {
-            let first = line.trim_start().trim_start_matches("\"\"\"");
-            if let Some(inner) = first.strip_suffix("\"\"\"") {
+        let content = if content.trim_start().starts_with("\"\"\"") {
+            let first_inner = content.trim_start().trim_start_matches("\"\"\"");
+            if let Some(inner) = first_inner.strip_suffix("\"\"\"") {
                 inner.to_string()
             } else {
-                let mut buf = first.to_string();
+                let mut buf = first_inner.to_string();
                 buf.push('\n');
                 loop {
                     print!(". ");
@@ -347,7 +312,7 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
                 buf.trim_end_matches('\n').to_string()
             }
         } else {
-            line
+            content
         };
 
         if content.trim().is_empty() { continue; }
@@ -364,11 +329,14 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
         println!("\n");
     }
 
-    // Disable bracketed paste before returning.
-    print!("\x1b[?2004l");
-    io::stdout().flush().ok();
-
     Ok(())
+}
+
+/// Strip bracketed-paste escape markers that some terminals inject inline.
+fn strip_paste_markers(s: &str) -> String {
+    s.trim_start_matches("\x1b[200~")
+     .trim_end_matches("\x1b[201~")
+     .to_string()
 }
 
 /// Send one chat turn and stream the response to stdout.
