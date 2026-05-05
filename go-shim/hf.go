@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -280,14 +281,31 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 
 	endpoint := hfEndpoint(host)
 	token := os.Getenv("HF_TOKEN")
-	client := &http.Client{Timeout: 120 * time.Second}
 
-	commit, err := hfFetchCommit(ctx, client, endpoint, owner, repo, token)
+	// apiClient: short total timeout for metadata requests (commit, file list).
+	apiClient := &http.Client{Timeout: 120 * time.Second}
+
+	// dlClient: no body read timeout so large files can download without a
+	// deadline, but connection and header timeouts prevent hanging on stalls.
+	// Mirrors llama.cpp common/download.cpp approach.
+	dlClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+		},
+	}
+	_ = dlClient // used below
+
+	commit, err := hfFetchCommit(ctx, apiClient, endpoint, owner, repo, token)
 	if err != nil {
 		return err
 	}
 
-	files, err := hfFetchFiles(ctx, client, endpoint, owner, repo, commit, token)
+	files, err := hfFetchFiles(ctx, apiClient, endpoint, owner, repo, commit, token)
 	if err != nil {
 		return err
 	}
@@ -296,7 +314,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	chosen, err := selectGGUF(files, tag)
 	if err == nil {
 		downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + chosen.Path
-		ggufDesc, err := downloadHFBlob(ctx, client, downloadURL, token, layoutDir, owner, repo, commit, chosen)
+		ggufDesc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, chosen)
 		if err != nil {
 			return err
 		}
@@ -304,7 +322,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	}
 
 	// No GGUF found — pull safetensors files as a CNCF model-spec image.
-	return pullHFSafetensors(ctx, client, ref, layoutDir, endpoint, owner, repo, commit, token, files)
+	return pullHFSafetensors(ctx, dlClient, ref, layoutDir, endpoint, owner, repo, commit, token, files)
 }
 
 // safetensorsMediaType maps a file extension to the appropriate CNCF layer media type.
@@ -410,63 +428,147 @@ func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, layers []ocispec.De
 }
 
 // ---------------------------------------------------------------------------
-// downloadHFBlob — HTTP download with resume + content-addressed storage
+// stallReader — cancels the context if no bytes arrive within timeout.
+// Mirrors llama.cpp's implicit stall detection via cpp-httplib timeouts.
 // ---------------------------------------------------------------------------
+
+type stallReader struct {
+	r      io.Reader
+	timer  *time.Timer
+	cancel context.CancelFunc
+}
+
+func newStallReader(r io.Reader, timeout time.Duration, cancel context.CancelFunc) *stallReader {
+	sr := &stallReader{r: r, cancel: cancel}
+	sr.timer = time.AfterFunc(timeout, cancel)
+	return sr
+}
+
+func (sr *stallReader) Read(p []byte) (int, error) {
+	n, err := sr.r.Read(p)
+	if n > 0 {
+		sr.timer.Reset(60 * time.Second) // bytes arrived, reset stall clock
+	}
+	return n, err
+}
+
+func (sr *stallReader) stop() { sr.timer.Stop() }
+
+// ---------------------------------------------------------------------------
+// downloadHFBlob — HTTP download with resume, retry, and stall detection.
+// Mirrors llama.cpp common/download.cpp: 3 attempts, 2s/4s backoff.
+// ---------------------------------------------------------------------------
+
+const (
+	dlMaxAttempts  = 3
+	dlRetryBase    = 2 * time.Second // doubles each retry: 2s, 4s
+	dlStallTimeout = 60 * time.Second
+)
 
 func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layoutDir, owner, repo, commit string, file hfFile) (ocispec.Descriptor, error) {
 	if err := os.MkdirAll(filepath.Join(layoutDir, "blobs"), 0o755); err != nil {
 		return ocispec.Descriptor{}, err
 	}
 
-	// Deterministic temp path keyed by (owner, repo, commit prefix, filename)
-	// so a new commit never reuses bytes from an old one.
 	sanitize := strings.NewReplacer("/", "_", ":", "_", ".", "_")
 	tmpKey := sanitize.Replace(owner + "_" + repo + "_" + commit[:12] + "_" + filepath.Base(file.Path))
 	tmpPath := filepath.Join(layoutDir, "blobs", "hf-"+tmpKey+".part")
 
-	// Detect existing partial download.
-	startOffset := int64(0)
-	if fi, err := os.Stat(tmpPath); err == nil && fi.Size() > 0 && fi.Size() < file.Size {
-		startOffset = fi.Size()
-	}
-
-	// Progress bar.
 	label := "Pulling  " + filepath.Base(file.Path)
-	done := "Pulled   " + filepath.Base(file.Path)
+	doneLbl := "Pulled   " + filepath.Base(file.Path)
 	prog := mpb.New(mpb.WithWidth(80), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
-	bar := addLayerBar(prog, label, done, file.Size)
-	if startOffset > 0 {
-		bar.IncrInt64(startOffset)
+	bar := addLayerBar(prog, label, doneLbl, file.Size)
+
+	var lastErr error
+	for attempt := 0; attempt < dlMaxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := dlRetryBase * time.Duration(1<<uint(attempt-1)) // 2s, 4s
+			fmt.Fprintf(os.Stderr, "\n[llmman] retrying %s (attempt %d/%d, wait %v)\n",
+				filepath.Base(file.Path), attempt+1, dlMaxAttempts, delay)
+			select {
+			case <-ctx.Done():
+				bar.Abort(false)
+				prog.Wait()
+				return ocispec.Descriptor{}, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		// Re-read partial file size in case previous attempt downloaded some bytes.
+		startOffset := int64(0)
+		if fi, err := os.Stat(tmpPath); err == nil && fi.Size() > 0 && fi.Size() < file.Size {
+			startOffset = fi.Size()
+		}
+		bar.SetCurrent(startOffset)
+
+		desc, err := downloadAttempt(ctx, client, url, token, layoutDir, tmpPath, startOffset, file, bar)
+		if err == nil {
+			prog.Wait()
+			return desc, nil
+		}
+
+		lastErr = err
+		// 4xx errors are permanent — no point retrying.
+		if isHTTP4xx(err) {
+			break
+		}
+		// Network/5xx error: keep partial file, retry with resume.
+		fmt.Fprintf(os.Stderr, "[llmman] download error: %v\n", err)
 	}
 
-	// HTTP GET with optional Range header for resume.
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	bar.Abort(false)
+	prog.Wait()
+	os.Remove(tmpPath) // exhausted retries
+	return ocispec.Descriptor{}, fmt.Errorf("download %s failed after %d attempts: %w",
+		filepath.Base(file.Path), dlMaxAttempts, lastErr)
+}
+
+// isHTTP4xx returns true for permanent HTTP client errors (no point retrying).
+func isHTTP4xx(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, code := range []string{"HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"} {
+		if strings.Contains(s, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// downloadAttempt performs one download attempt with stall detection.
+func downloadAttempt(ctx context.Context, client *http.Client, url, token, layoutDir, tmpPath string, startOffset int64, file hfFile, bar *mpb.Bar) (ocispec.Descriptor, error) {
+	// Per-attempt context with stall cancellation.
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(attemptCtx, "GET", url, nil)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	if startOffset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
 	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		bar.Abort(false)
-		prog.Wait()
 		return ocispec.Descriptor{}, fmt.Errorf("download %s: %w", file.Path, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
-		bar.Abort(false)
-		prog.Wait()
 		return ocispec.Descriptor{}, fmt.Errorf("download %s: HTTP %d", file.Path, resp.StatusCode)
 	}
-	// Server ignored Range: reset to full download.
 	if startOffset > 0 && resp.StatusCode == 200 {
+		// Server ignored Range header — restart from zero.
 		startOffset = 0
 		bar.SetCurrent(0)
 	}
 
-	// Open file: append for resume, create fresh otherwise.
 	digester := digest.Canonical.Digester()
 	var f *os.File
 	if startOffset > 0 {
@@ -477,30 +579,31 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 				f, _ = os.OpenFile(tmpPath, os.O_APPEND|os.O_WRONLY, 0o644)
 			}
 		}
-		if f == nil { // fallback: start fresh
+		if f == nil {
 			digester = digest.Canonical.Digester()
 			startOffset = 0
 		}
 	}
 	if f == nil {
 		if f, err = os.Create(tmpPath); err != nil {
-			bar.Abort(false)
-			prog.Wait()
 			return ocispec.Descriptor{}, err
 		}
 	}
 
-	proxyRC := bar.ProxyReader(resp.Body)
+	// Wrap with stall detector: cancel attemptCtx if no bytes for 60s.
+	sr := newStallReader(resp.Body, dlStallTimeout, cancel)
+	defer sr.stop()
+
+	proxyRC := bar.ProxyReader(sr)
 	if proxyRC == nil {
-		proxyRC = io.NopCloser(resp.Body)
+		proxyRC = io.NopCloser(sr)
 	}
 	written, copyErr := io.Copy(io.MultiWriter(f, digester.Hash()), proxyRC)
 	proxyRC.Close()
 	f.Close()
-	prog.Wait()
 
 	if copyErr != nil {
-		os.Remove(tmpPath)
+		// Partial file kept for resume on next attempt — do NOT remove it here.
 		return ocispec.Descriptor{}, fmt.Errorf("write %s: %w", file.Path, copyErr)
 	}
 	total := startOffset + written
