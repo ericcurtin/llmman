@@ -237,7 +237,7 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
     eprintln!("Type a message, /bye to exit, or \"\"\" for multiline input.");
 
     loop {
-        print!(">>> ");
+        print!("> ");
         io::stdout().flush().ok();
 
         let mut line = String::new();
@@ -275,7 +275,7 @@ async fn run_interactive(client: &Client, model: &str) -> anyhow::Result<()> {
                 let mut buf = first.to_string();
                 buf.push('\n');
                 loop {
-                    print!("... ");
+                    print!(". ");
                     io::stdout().flush().ok();
                     let mut more = String::new();
                     let m = reader.read_line(&mut more).await?;
