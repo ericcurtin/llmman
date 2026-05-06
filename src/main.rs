@@ -1,7 +1,10 @@
+#![recursion_limit = "256"]
+
 mod cmd;
 mod ffi;
 mod shortnames;
 mod storage;
+pub mod webui;
 
 use std::path::{Path, PathBuf};
 

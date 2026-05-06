@@ -1,7 +1,11 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 /// Extract every object from a (possibly GNU ar) static archive and repack
 /// it as an MSVC-format LIB using lib.exe.  This is needed on Windows ARM64
@@ -188,5 +192,24 @@ fn main() {
 
     println!("cargo:rerun-if-changed=go-shim/");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PODMAN");
+
+    // ── Gzip web UI assets for embedding ──────────────────────────────────
+    let webui_src = manifest_dir.join("webui");
+    let webui_out = out_dir.join("webui_gz");
+    fs::create_dir_all(&webui_out).expect("create webui_gz dir");
+
+    for name in &["index.html", "bundle.js", "bundle.css", "loading.html"] {
+        let src = webui_src.join(name);
+        let dst = webui_out.join(format!("{name}.gz"));
+        let data = fs::read(&src)
+            .unwrap_or_else(|e| panic!("read webui/{name}: {e}"));
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&data).expect("gzip write");
+        let compressed = enc.finish().expect("gzip finish");
+        fs::write(&dst, &compressed)
+            .unwrap_or_else(|e| panic!("write {name}.gz: {e}"));
+    }
+
+    println!("cargo:rerun-if-changed=webui/");
 }
 

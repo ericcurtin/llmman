@@ -22,6 +22,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
 use crate::storage::OciStore;
+use crate::webui;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -953,8 +954,110 @@ async fn stream_anthropic(
 // Route handlers
 // ---------------------------------------------------------------------------
 
+fn gzipped(body: &'static [u8], content_type: &'static str) -> Response {
+    Response::builder()
+        .header("content-type", content_type)
+        .header("content-encoding", "gzip")
+        .header("cache-control", "public, max-age=3600")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 async fn handle_root() -> impl IntoResponse {
-    "llmman is running"
+    gzipped(webui::INDEX_HTML, "text/html; charset=utf-8")
+}
+
+async fn handle_bundle_js() -> impl IntoResponse {
+    gzipped(webui::BUNDLE_JS, "application/javascript; charset=utf-8")
+}
+
+async fn handle_bundle_css() -> impl IntoResponse {
+    gzipped(webui::BUNDLE_CSS, "text/css; charset=utf-8")
+}
+
+async fn handle_loading_html() -> impl IntoResponse {
+    gzipped(webui::LOADING_HTML, "text/html; charset=utf-8")
+}
+
+async fn handle_props() -> impl IntoResponse {
+    // Return a minimal llama.cpp-compatible /props response in ROUTER mode.
+    // The web UI uses `role` to detect multi-model (router) vs single-model mode.
+    Json(serde_json::json!({
+        "role": "router",
+        "total_slots": 0,
+        "model_path": "",
+        "chat_template": "",
+        "bos_token": "",
+        "eos_token": "",
+        "build_info": env!("CARGO_PKG_VERSION"),
+        "modalities": { "vision": false, "audio": false },
+        "default_generation_settings": {
+            "id": 0,
+            "id_task": 0,
+            "n_ctx": 4096,
+            "speculative": false,
+            "is_processing": false,
+            "params": {
+                "n_predict": -1,
+                "seed": 0,
+                "temperature": 0.8,
+                "dynatemp_range": 0.0,
+                "dynatemp_exponent": 1.0,
+                "top_k": 40,
+                "top_p": 0.95,
+                "min_p": 0.05,
+                "top_n_sigma": 0.0,
+                "xtc_probability": 0.0,
+                "xtc_threshold": 0.1,
+                "typ_p": 1.0,
+                "repeat_last_n": 64,
+                "repeat_penalty": 1.0,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "dry_multiplier": 0.0,
+                "dry_base": 1.75,
+                "dry_allowed_length": 2,
+                "dry_penalty_last_n": -1,
+                "dry_sequence_breakers": [],
+                "mirostat": 0,
+                "mirostat_tau": 5.0,
+                "mirostat_eta": 0.1,
+                "stop": [],
+                "max_tokens": -1,
+                "n_keep": 0,
+                "n_discard": 0,
+                "ignore_eos": false,
+                "stream": true,
+                "logit_bias": [],
+                "n_probs": 0,
+                "min_keep": 0,
+                "grammar": "",
+                "grammar_lazy": false,
+                "grammar_triggers": [],
+                "preserved_tokens": [],
+                "chat_format": "",
+                "reasoning_format": "",
+                "reasoning_in_content": false,
+                "generation_prompt": "",
+                "samplers": ["top_k", "top_p", "min_p", "temperature"],
+                "backend_sampling": false,
+                "speculative.n_max": 16,
+                "speculative.n_min": 5,
+                "speculative.p_min": 0.9,
+                "timings_per_token": false,
+                "post_sampling_probs": false,
+                "lora": []
+            },
+            "prompt": "",
+            "next_token": {
+                "has_next_token": false,
+                "has_new_line": false,
+                "n_remain": 0,
+                "n_decoded": 0,
+                "stopping_word": ""
+            }
+        }
+    }))
 }
 
 async fn handle_version() -> impl IntoResponse {
@@ -1312,8 +1415,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     let app_state = state.clone();
     let app = Router::new()
-        // Health
+        // Web UI
         .route("/", get(handle_root))
+        .route("/bundle.js", get(handle_bundle_js))
+        .route("/bundle.css", get(handle_bundle_css))
+        .route("/loading.html", get(handle_loading_html))
+        // llama.cpp-compatible props endpoint (router mode)
+        .route("/props", get(handle_props))
         // Ollama API
         .route("/api/version", get(handle_version))
         .route("/api/tags", get(handle_tags))

@@ -34,4 +34,4 @@ docker = []
 podman = []
 
 [build-dependencies]
-# build.rs uses only std
+flate2 = "1"
