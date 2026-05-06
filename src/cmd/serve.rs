@@ -1258,18 +1258,54 @@ async fn handle_openai_models(
 ) -> Result<impl IntoResponse, AppError> {
     let store = OciStore::open(&state.0.store_path)?;
     let list = store.list()?;
+    let mgr = state.0.manager.lock().await;
     let data: Vec<serde_json::Value> = list
         .into_iter()
         .map(|img| {
+            let loaded = mgr.running.contains_key(&img.reference);
             serde_json::json!({
                 "id": img.reference,
                 "object": "model",
                 "created": 0,
                 "owned_by": "llmman",
+                // status field consumed by the web UI to track loaded/unloaded state
+                "status": { "value": if loaded { "loaded" } else { "unloaded" } },
             })
         })
         .collect();
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
+}
+
+// POST /models/load — web UI calls this to warm a model into memory.
+// Mirrors the llmman serve on-demand loading: ensure_model() blocks until
+// llama-server is ready, then returns. The poll in the UI will then see
+// status="loaded" on the very next /v1/models request.
+async fn handle_models_load(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let model = req["model"].as_str().unwrap_or("").to_string();
+    if model.is_empty() {
+        return Err(AppError(anyhow::anyhow!("model field is required")));
+    }
+    ensure_model(&state, &model).await?;
+    Ok(Json(serde_json::json!({ "status": "loaded" })))
+}
+
+// POST /models/unload — web UI calls this to release a model from memory.
+async fn handle_models_unload(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let model = req["model"].as_str().unwrap_or("").to_string();
+    if model.is_empty() {
+        return Err(AppError(anyhow::anyhow!("model field is required")));
+    }
+    let resolved = crate::shortnames::resolve(&model);
+    let canonical = canonical_ref(&state.0.store_path, &resolved);
+    let mut mgr = state.0.manager.lock().await;
+    mgr.running.remove(&canonical);
+    Ok(Json(serde_json::json!({ "status": "unloaded" })))
 }
 
 async fn handle_openai_chat(
@@ -1440,6 +1476,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/api/delete", delete(handle_delete))
         .route("/api/chat", post(handle_ollama_chat))
         .route("/api/generate", post(handle_ollama_generate))
+        // Model lifecycle (consumed by the web UI)
+        .route("/models/load",   post(handle_models_load))
+        .route("/models/unload", post(handle_models_unload))
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
         .route("/v1/chat/completions", post(handle_openai_chat))
