@@ -963,8 +963,17 @@ fn gzipped(body: &'static [u8], content_type: &'static str) -> Response {
         .unwrap()
 }
 
-async fn handle_root() -> impl IntoResponse {
-    gzipped(webui::INDEX_HTML, "text/html; charset=utf-8")
+async fn handle_root(headers: HeaderMap) -> impl IntoResponse {
+    let wants_html = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/html"))
+        .unwrap_or(false);
+    if wants_html {
+        gzipped(webui::INDEX_HTML, "text/html; charset=utf-8").into_response()
+    } else {
+        "llmman is running".into_response()
+    }
 }
 
 async fn handle_bundle_js() -> impl IntoResponse {
