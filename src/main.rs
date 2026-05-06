@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Launch an AI coding assistant integration (claude, opencode, codex, …)
+    /// Launch an integration
     Launch(cmd::launch::LaunchArgs),
     /// Run a model interactively or with a one-shot prompt
     Run(cmd::run::RunArgs),
@@ -49,7 +49,7 @@ enum Commands {
     Rm(cmd::rm::RmArgs),
     /// Show the manifest of a local (or remote with --remote) image
     Inspect(cmd::inspect::InspectArgs),
-    /// Start an inference server (Ollama / OpenAI / Anthropic compatible APIs)
+    /// Start an inference server (Ollama, OpenAI, Anthropic compatible APIs)
     Serve(cmd::serve::ServeArgs),
     /// Create a new local tag pointing to an existing image
     Tag(cmd::tag::TagArgs),
