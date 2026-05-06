@@ -89,6 +89,9 @@ struct OllamaGenerateRequest {
     #[serde(default = "bool_true")]
     stream: bool,
     options: Option<serde_json::Value>,
+    /// keep_alive: 0 with an empty prompt is the Ollama unload signal
+    #[serde(default)]
+    keep_alive: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1221,9 +1224,27 @@ async fn handle_ollama_generate(
     Json(req): Json<OllamaGenerateRequest>,
 ) -> Result<Response, AppError> {
     eprintln!("[llmman] /api/generate model={:?} prompt_len={}", req.model, req.prompt.len());
+
+    // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
+    let is_unload = req.prompt.is_empty() && req.keep_alive.as_ref()
+        .and_then(|v| v.as_i64()).map(|n| n == 0).unwrap_or(false);
+    if is_unload {
+        let resolved = crate::shortnames::resolve(&req.model);
+        let canonical = canonical_ref(&state.0.store_path, &resolved);
+        state.0.manager.lock().await.running.remove(&canonical);
+        return Ok(Json(OllamaGenerateChunk {
+            model: req.model,
+            created_at: now_rfc3339(),
+            response: String::new(),
+            thinking: None,
+            done: true,
+            done_reason: Some("unload".into()),
+        })
+        .into_response());
+    }
+
     let port = ensure_model(&state, &req.model).await?;
-    // Empty prompt = load-only request (matches ollama server/routes.go:429).
-    // scheduleRunner (ensure_model) has already loaded the model above.
+    // Empty prompt = load-only request (mirrors ollama server/routes.go:429).
     if req.prompt.is_empty() {
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
@@ -1276,37 +1297,7 @@ async fn handle_openai_models(
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
 
-// POST /models/load — web UI calls this to warm a model into memory.
-// Mirrors the llmman serve on-demand loading: ensure_model() blocks until
-// llama-server is ready, then returns. The poll in the UI will then see
-// status="loaded" on the very next /v1/models request.
-async fn handle_models_load(
-    State(state): State<AppState>,
-    Json(req): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, AppError> {
-    let model = req["model"].as_str().unwrap_or("").to_string();
-    if model.is_empty() {
-        return Err(AppError(anyhow::anyhow!("model field is required")));
-    }
-    ensure_model(&state, &model).await?;
-    Ok(Json(serde_json::json!({ "status": "loaded" })))
-}
 
-// POST /models/unload — web UI calls this to release a model from memory.
-async fn handle_models_unload(
-    State(state): State<AppState>,
-    Json(req): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, AppError> {
-    let model = req["model"].as_str().unwrap_or("").to_string();
-    if model.is_empty() {
-        return Err(AppError(anyhow::anyhow!("model field is required")));
-    }
-    let resolved = crate::shortnames::resolve(&model);
-    let canonical = canonical_ref(&state.0.store_path, &resolved);
-    let mut mgr = state.0.manager.lock().await;
-    mgr.running.remove(&canonical);
-    Ok(Json(serde_json::json!({ "status": "unloaded" })))
-}
 
 async fn handle_openai_chat(
     State(state): State<AppState>,
@@ -1476,9 +1467,6 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/api/delete", delete(handle_delete))
         .route("/api/chat", post(handle_ollama_chat))
         .route("/api/generate", post(handle_ollama_generate))
-        // Model lifecycle (consumed by the web UI)
-        .route("/models/load",   post(handle_models_load))
-        .route("/models/unload", post(handle_models_unload))
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
         .route("/v1/chat/completions", post(handle_openai_chat))
